@@ -1,0 +1,15 @@
+{
+  "model": "gpt-5.1-codex-mini",
+  "test_command": "npm test",
+  "build_command": "npm run build",
+  "max_files_per_run": 5,
+  "include_globs": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude_globs": ["**/node_modules/**", "**/dist/**"],
+
+  "validators": [
+    { "name": "lint", "command": "npm run lint", "shell": true },
+    { "name": "typecheck", "command": "npm run typecheck", "shell": true },
+    { "name": "tests", "command": "npm test", "shell": true },
+    { "name": "build", "command": "npm run build", "shell": true }
+  ]
+}

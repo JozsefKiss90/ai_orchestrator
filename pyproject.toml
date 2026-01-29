@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-orchestrator"
+version = "0.1.0"
+description = "AI-driven orchestrator for automated code evolution"
+requires-python = ">=3.10"
+dependencies = [
+  "openai>=1.0.0",
+]
+
+[project.scripts]
+ai-dev = "ai_orchestrator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ai_orchestrator*"]
