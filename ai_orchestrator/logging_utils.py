@@ -34,37 +34,70 @@ def _fmt() -> logging.Formatter:
     )
 
 
+def _ensure_logrecord_defaults_installed() -> None:
+    """
+    Ensure formatter-required fields always exist, even for plain logging.getLogger(__name__)
+    calls without adapters. This prevents KeyError in the formatter.
+    """
+    if getattr(logging, "_ai_orchestrator_record_factory", None) is not None:
+        return
+
+    old_factory = logging.getLogRecordFactory()
+
+    def record_factory(*args, **kwargs):
+        record = old_factory(*args, **kwargs)
+        for k, v in {
+            "run_id": "-",
+            "run_name": "-",
+            "dry_run": False,
+            "branch": "",
+            "node_id": "-",
+            "phase": "-",
+        }.items():
+            if not hasattr(record, k):
+                setattr(record, k, v)
+        return record
+
+    logging.setLogRecordFactory(record_factory)
+    setattr(logging, "_ai_orchestrator_record_factory", record_factory)
+
+
 def init_run_logging(
     *,
     run_dir: Path,
     level: str = "INFO",
 ) -> None:
     """
-    One-time setup for the process.
-    Writes to console + run.log.
+    Process-wide logging setup.
+    - Console handler once
+    - A run-scoped file handler (run.log) for the run_dir
     """
+    _ensure_logrecord_defaults_installed()
+
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
-
-    # Avoid duplicated handlers if CLI calls multiple times in-process (tests, etc.)
-    if getattr(root, "_ai_orchestrator_configured", False):
-        return
-    setattr(root, "_ai_orchestrator_configured", True)
-
     formatter = _fmt()
 
-    # Console
-    sh = logging.StreamHandler()
-    sh.setLevel(root.level)
-    sh.setFormatter(formatter)
-    root.addHandler(sh)
+    # Console (install once)
+    if not getattr(root, "_ai_orchestrator_console", False):
+        sh = logging.StreamHandler()
+        sh.setLevel(root.level)
+        sh.setFormatter(formatter)
+        root.addHandler(sh)
+        setattr(root, "_ai_orchestrator_console", True)
 
-    # Run file
+    # Run file handler (install per run_dir if not already present)
     run_dir.mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(run_dir / "run.log", encoding="utf-8")
-    fh.setLevel(root.level)
-    fh.setFormatter(formatter)
-    root.addHandler(fh)
+    run_log_path = (run_dir / "run.log").resolve()
+
+    existing = getattr(root, "_ai_orchestrator_run_logs", set())
+    if str(run_log_path) not in existing:
+        fh = logging.FileHandler(run_log_path, encoding="utf-8")
+        fh.setLevel(root.level)
+        fh.setFormatter(formatter)
+        root.addHandler(fh)
+        existing.add(str(run_log_path))
+        setattr(root, "_ai_orchestrator_run_logs", existing)
 
 
 def make_logger(
@@ -92,11 +125,14 @@ def add_node_file_handler(
     *,
     node_dir: Path,
     level: Optional[int] = None,
-) -> None:
+) -> logging.Handler:
     """
-    Adds a file handler that captures everything (all modules) into node.log,
-    so you can open one file and see what happened for that node.
+    Adds a file handler that captures everything (all modules) into node.log.
+
+    Returns the handler so the caller can remove it when the node finishes.
     """
+    _ensure_logrecord_defaults_installed()
+
     root = logging.getLogger()
     formatter = _fmt()
 
@@ -105,3 +141,16 @@ def add_node_file_handler(
     fh.setLevel(level if level is not None else root.level)
     fh.setFormatter(formatter)
     root.addHandler(fh)
+    return fh
+
+
+def remove_handler(handler: logging.Handler) -> None:
+    root = logging.getLogger()
+    try:
+        root.removeHandler(handler)
+    except Exception:
+        pass
+    try:
+        handler.close()
+    except Exception:
+        pass

@@ -12,13 +12,14 @@ from .phases.plan import PlanPhase
 from .graph.types import DAG, Node
 from .graph.runner import DagRunner
 from .graph.planner import DagPlanner, PlannedDAGSpec, PlannedNodeSpec
-
+from .phases.scaffold import ScaffoldPhase
 
 PHASE_REGISTRY: Dict[str, Type[Phase]] = {
+    ScaffoldPhase.name: ScaffoldPhase,
     OopRefactorPhase.name: OopRefactorPhase,
-    PlanPhase.name: PlanPhase,  # planner is optional; invoked only with --use-plan
-    # later: add more phases here
+    PlanPhase.name: PlanPhase,  # invoked only with --use-plan
 }
+
 
 
 class WorkflowRunner:
@@ -81,6 +82,7 @@ class WorkflowRunner:
                     phase=n["phase"],
                     deps=list(n.get("deps", [])),
                     validators=list(n.get("validators", [])),
+                    objective=str(n.get("objective", "") or ""),
                 )
             )
 

@@ -40,6 +40,8 @@ SCHEMA_UNIFIED_DIFF_V1: Dict[str, Any] = {
         "diff": {"type": "string", "minLength": 1},
         "notes": {"type": "string"},
     },
+    # strict-mode rule: required must include every key in properties
+    # so we keep both keys required BUT allow notes to be empty string.
     "required": ["diff", "notes"],
     "additionalProperties": False,
 }
@@ -182,6 +184,17 @@ class LLMClient:
     ) -> Dict[str, Any]:
         self._preflight_strict_schema(schema)
 
+        def _json_retry_prompt(reason: str) -> str:
+            return (
+                user_prompt
+                + "\n\n"
+                + "IMPORTANT:\n"
+                + "- Return ONLY valid JSON matching the schema.\n"
+                + "- Do NOT include markdown fences.\n"
+                + "- Do NOT include raw newlines inside JSON string values; escape them as \\n.\n"
+                + f"- Previous output was invalid JSON because: {reason}\n"
+            )
+
         # Preferred path: Responses API + Structured Outputs via text.format
         try:
             response = self._client.responses.create(
@@ -201,28 +214,20 @@ class LLMClient:
                 **self._responses_kwargs(),
             )
 
-            # Prefer SDK-provided parsed output (best case)
+            # 1) Best case: SDK gives parsed output
             parsed = self._coerce_parsed(getattr(response, "output_parsed", None))
             if isinstance(parsed, dict):
                 return parsed
 
-            # Fallback: parse text extracted from response structure
+            # 2) Fallback: extract text and parse
             raw = self._extract_response_text(response)
             if not raw.strip():
-                # Codex models do NOT support chat completions.
-                # Retry Responses once with a simplified instruction.
+                # Retry once with stronger instruction
                 retry_response = self._client.responses.create(
                     model=self._config.model,
                     input=[
                         {"role": "system", "content": system_prompt},
-                        {
-                            "role": "user",
-                            "content": (
-                                user_prompt
-                                + "\n\nIMPORTANT: Return ONLY valid JSON matching the schema. "
-                                "No prose, no markdown, no explanation."
-                            ),
-                        },
+                        {"role": "user", "content": _json_retry_prompt("empty output")},
                     ],
                     text={
                         "format": {
@@ -257,7 +262,39 @@ class LLMClient:
             try:
                 return json.loads(raw)
             except json.JSONDecodeError as e:
-                raise RuntimeError(f"Model returned invalid JSON: {e}\nRaw output:\n{raw}")
+                # 3) If parsing fails (common when model emits raw newlines in strings),
+                # retry once with explicit JSON escaping instruction.
+                retry_response = self._client.responses.create(
+                    model=self._config.model,
+                    input=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": _json_retry_prompt(str(e))},
+                    ],
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": schema_name,
+                            "schema": schema,
+                            "strict": True,
+                        }
+                    },
+                    **self._responses_kwargs(),
+                )
+
+                parsed_retry = self._coerce_parsed(getattr(retry_response, "output_parsed", None))
+                if isinstance(parsed_retry, dict):
+                    return parsed_retry
+
+                raw_retry = self._extract_response_text(retry_response)
+                if not raw_retry.strip():
+                    raise RuntimeError(f"Model returned invalid JSON and retry was empty. First error: {e}")
+
+                try:
+                    return json.loads(raw_retry)
+                except json.JSONDecodeError as e2:
+                    raise RuntimeError(
+                        f"Model returned invalid JSON twice: {e2}\nRaw output:\n{raw_retry}"
+                    )
 
         except TypeError:
             # Compatibility fallback: Chat Completions API
@@ -283,4 +320,27 @@ class LLMClient:
             try:
                 return json.loads(content)
             except json.JSONDecodeError as e:
-                raise RuntimeError(f"Chat Completions returned invalid JSON: {e}\nRaw output:\n{content}")
+                # Retry once with stronger constraints
+                chat2 = self._client.chat.completions.create(
+                    model=self._config.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": _json_retry_prompt(str(e))},
+                    ],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema_name,
+                            "schema": schema,
+                            "strict": True,
+                        },
+                    },
+                    temperature=self._config.temperature if self._supports_temperature() else 1.0,
+                )
+                content2 = chat2.choices[0].message.content or ""
+                if not content2.strip():
+                    raise RuntimeError(f"Chat Completions JSON retry returned empty content. First error: {e}")
+                try:
+                    return json.loads(content2)
+                except json.JSONDecodeError as e2:
+                    raise RuntimeError(f"Chat Completions returned invalid JSON twice: {e2}\nRaw:\n{content2}")

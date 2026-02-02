@@ -1,12 +1,13 @@
+@"
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 
 # Virtual environments
-venv/
-.env/
 .venv/
+venv/
+env/
 
 # Packaging
 *.egg-info/
@@ -20,3 +21,4 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+"@ | Set-Content -Encoding utf8 .gitignore

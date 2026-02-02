@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -111,65 +112,85 @@ class Repo:
 
     # ---------- Unified diff hardening ----------
 
+    _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+
     @staticmethod
     def _diff_sanity_check(diff_text: str) -> Tuple[bool, str]:
         """
         Fast local validation to prevent common 'No valid patches in input' failures.
 
-        We accept either:
-          - modern header: "diff --git a/... b/..."
-          OR
-          - legacy header pair: "--- a/..." and "+++ b/..."
+        Accept:
+          - modern header blocks: 'diff --git a/... b/...'
+          - plus-file headers: '--- ...' and '+++ ...' where each can be:
+              - 'a/<path>' / 'b/<path>'
+              - '/dev/null' (new/deleted file)
+        Require:
+          - at least one valid range hunk header:
+              @@ -l,s +l,s @@
+          - hard reject any invalid hunk header (e.g. naked '@@').
 
-        And we require at least one range hunk header:
-          @@ -l,s +l,s @@
-
-        This is intentionally simple string matching (no regex) to avoid false negatives.
+        NOTE: We intentionally DO NOT require both 'diff --git' and legacy headers simultaneously.
+        Many valid diffs contain both, but some tools emit only one style.
         """
         if not isinstance(diff_text, str) or not diff_text.strip():
             return False, "Diff is empty."
 
-        txt = diff_text.strip()
+        txt = diff_text.strip("\n")
 
-        has_diff_git = "diff --git " in txt
-        has_legacy_headers = ("--- a/" in txt) and ("+++ b/" in txt)
-        if not (has_diff_git and has_legacy_headers):
+        lines = txt.splitlines()
+
+        has_diff_git = any(line.startswith("diff --git ") for line in lines)
+        has_minus = any(line.startswith("--- ") for line in lines)
+        has_plus = any(line.startswith("+++ ") for line in lines)
+
+        if not (has_diff_git or (has_minus and has_plus)):
             return False, (
-                "Diff must include both 'diff --git a/... b/...' and '--- a/...'/ '+++ b/...'."
+                "Diff must include either a 'diff --git a/... b/...' header or a '--- ...'/'+++ ...' header pair."
             )
 
-        # Require at least one proper range hunk header
-        # (the earlier failure mode was '@@' without ranges).
-        for line in txt.splitlines():
+        # Validate that ---/+++ paths look git-ish if present
+        if has_minus or has_plus:
+            if not (has_minus and has_plus):
+                return False, "Diff contains only one of '---' or '+++' headers; both are required."
+            # Allow: a/<path>, b/<path>, /dev/null
+            bad_headers: List[str] = []
+            for line in lines:
+                if line.startswith("--- "):
+                    p = line[4:].strip()
+                    if p != "/dev/null" and not (p.startswith("a/") or p.startswith("b/")):
+                        bad_headers.append(line)
+                if line.startswith("+++ "):
+                    p = line[4:].strip()
+                    if p != "/dev/null" and not (p.startswith("a/") or p.startswith("b/")):
+                        bad_headers.append(line)
+            if bad_headers:
+                return False, f"Diff contains non-git file header(s): {bad_headers[:3]!r}"
+
+        # Hard reject invalid hunks; require at least one valid hunk header.
+        saw_hunk = False
+        for line in lines:
             if line.startswith("@@"):
-                # must look like: @@ -1,6 +1,11 @@
-                if "@@ -" not in line or " +" not in line or " @@" not in line:
+                saw_hunk = True
+                if Repo._HUNK_RE.match(line) is None:
                     return False, (
                         "Diff contains an invalid hunk header. Expected '@@ -l,s +l,s @@' "
                         f"but got: {line!r}"
                     )
 
+        if not saw_hunk:
+            return False, "Diff contains no hunk headers ('@@ -l,s +l,s @@')."
+
         return True, "ok"
-
-    def _normalize_unified_diff(self, diff_text: str) -> str:
-        """
-        Normalize diff text for git apply:
-        - normalize line endings to LF
-        - ensure final trailing newline (git can treat missing final newline as corrupt patch)
-        """
-        txt = (diff_text or "").replace("\r\n", "\n").replace("\r", "\n")
-        if txt and not txt.endswith("\n"):
-            txt += "\n"
-        return txt
-
 
     def check_unified_diff(self, diff_text: str) -> CommandResult:
         """
         Runs `git apply --check` to produce diagnostics for failures without applying.
         """
-        diff_text = self._normalize_unified_diff(diff_text)
-        ok, msg = self._diff_sanity_check(diff_text)
+        # (2) Windows-hardening: ensure trailing newline so stdin piping can't produce "corrupt patch" due to EOF edge cases.
+        if isinstance(diff_text, str) and diff_text and not diff_text.endswith("\n"):
+            diff_text = diff_text + "\n"
 
+        ok, msg = self._diff_sanity_check(diff_text)
         if not ok:
             return CommandResult(returncode=2, stdout="", stderr=f"Invalid unified diff: {msg}")
 
@@ -182,7 +203,6 @@ class Repo:
             capture_output=True,
         )
         stderr = proc.stderr or ""
-        # Normalize a common opaque failure into something actionable
         if proc.returncode != 0 and "No valid patches in input" in stderr:
             stderr = (
                 "git apply --check failed: No valid patches in input.\n"
@@ -190,6 +210,7 @@ class Repo:
                 f"Raw git stderr:\n{proc.stderr}"
             )
         return CommandResult(returncode=proc.returncode, stdout=proc.stdout, stderr=stderr)
+
 
     def apply_unified_diff(self, diff_text: str, *, update_index: bool = False) -> CommandResult:
         """
@@ -203,9 +224,11 @@ class Repo:
         Uses:
           git apply --whitespace=nowarn --recount [--index]
         """
-        diff_text = self._normalize_unified_diff(diff_text)
-        ok, msg = self._diff_sanity_check(diff_text)
+        # (2) Windows-hardening: ensure trailing newline so stdin piping can't produce "corrupt patch" due to EOF edge cases.
+        if isinstance(diff_text, str) and diff_text and not diff_text.endswith("\n"):
+            diff_text = diff_text + "\n"
 
+        ok, msg = self._diff_sanity_check(diff_text)
         if not ok:
             return CommandResult(returncode=2, stdout="", stderr=f"Invalid unified diff: {msg}")
 
@@ -232,6 +255,7 @@ class Repo:
                 f"Raw git stderr:\n{proc.stderr}"
             )
         return CommandResult(returncode=proc.returncode, stdout=proc.stdout, stderr=stderr)
+
 
     def apply_patches(self, patches: List[Patch]) -> CommandResult:
         """

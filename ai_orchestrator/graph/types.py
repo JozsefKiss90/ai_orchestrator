@@ -19,6 +19,7 @@ class Node:
     - validators: list of validator names to run for this node (e.g., ["lint","tests"])
       If empty, runner uses DAG.default_validators.
     - commit: whether to commit after this node if validation passes (when commit_policy="per_node")
+    - objective: planner-provided human-readable objective for this node
     """
     id: str
     phase_name: str
@@ -26,6 +27,7 @@ class Node:
     deps: List[str] = field(default_factory=list)
     validators: List[str] = field(default_factory=list)
     commit: bool = True
+    objective: str = ""
 
 
 @dataclass(frozen=True)

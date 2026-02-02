@@ -12,10 +12,7 @@ SCHEMA_DAG_PLAN_V1: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "commit_policy": {"type": "string", "enum": ["per_node", "end"]},
-        "default_validators": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
+        "default_validators": {"type": "array", "items": {"type": "string"}},
         "nodes": {
             "type": "array",
             "items": {
@@ -25,13 +22,14 @@ SCHEMA_DAG_PLAN_V1: Dict[str, Any] = {
                     "phase": {"type": "string"},
                     "deps": {"type": "array", "items": {"type": "string"}},
                     "validators": {"type": "array", "items": {"type": "string"}},
+                    "objective": {"type": "string"},
                 },
-                "required": ["id", "phase"],
+                "required": ["id", "phase", "deps", "validators", "objective"],
                 "additionalProperties": False,
             },
         },
     },
-    "required": ["nodes"],
+    "required": ["commit_policy", "default_validators", "nodes"],
     "additionalProperties": False,
 }
 
@@ -64,14 +62,15 @@ class PlanPhase(Phase):
             f"Requested target phase: {requested_phase}\n"
             f"Available phases: {available_phases}\n"
             f"Available validators: {available_validators}\n\n"
-            "Requirements:\n"
-            "- Output 2 to 4 nodes maximum.\n"
-            "- Use commit_policy 'per_node' unless there is a strong reason not to.\n"
-            "- Use validators: include at least 'tests' if present.\n"
-            "- Nodes should form a valid DAG (deps refer to earlier nodes).\n\n"
-            "Suggested structure (adapt as needed):\n"
-            "  scaffold -> implement -> test -> fix\n"
-            "But only use phases that exist.\n\n"
+            "Hard requirements:\n"
+            "- Output EXACTLY 3 nodes.\n"
+            "- commit_policy MUST be 'per_node'.\n"
+            "- Node 1 MUST be phase 'scaffold'.\n"
+            "- Node 2 MUST be phase 'oop_refactor' and depend on Node 1.\n"
+            "- Node 3 MUST be phase 'oop_refactor' OR 'scaffold' is NOT allowed; it MUST be any phase that makes sense "
+            "for verification, but since phases are limited, use phase 'oop_refactor' with no patches and validators only.\n"
+            "- Every node MUST include validators ['tests'] if 'tests' is available.\n"
+            "- Deps must refer only to earlier node ids.\n\n"
             "Return ONLY JSON per schema."
         )
 
