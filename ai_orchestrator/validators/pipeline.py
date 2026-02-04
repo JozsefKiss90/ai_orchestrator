@@ -9,6 +9,8 @@ from ..repo import Repo, CommandResult
 from .types import PipelineResult, ValidatorResult, ValidatorSpec
 from .policy import run_policy_validator
 
+import logging
+log = logging.getLogger(__name__)
 
 class ValidatorPipeline:
     """
@@ -32,6 +34,7 @@ class ValidatorPipeline:
 
             if spec.kind == "policy":
                 params = spec.params or {}
+                log.info("Validator start", extra={"fields": {"validator": spec.name, "kind": spec.kind}})
                 vr = run_policy_validator(name=spec.policy or spec.name, repo=repo, params=params)
                 vr.duration_s = float(time.time() - start)  # type: ignore[misc]
                 results.append(vr)
@@ -64,8 +67,13 @@ class ValidatorPipeline:
                 duration_s=float(time.time() - start),
             )
             results.append(vr)
+            log.info(
+                "Validator end",
+                extra={"fields": {"validator": vr.name, "ok": vr.ok, "exit_code": vr.exit_code, "duration_s": round(vr.duration_s, 3)}},
+            )
 
             if self.stop_on_fail and not vr.ok:
+                log.warning("Stopping early due to validator failure", extra={"fields": {"failed_validator": vr.name}})
                 stopped_early = True
                 break
 

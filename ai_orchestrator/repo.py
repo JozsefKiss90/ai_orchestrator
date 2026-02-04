@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from .patching import FileContentPatch, Patch, UnifiedDiffPatch
-
+import logging
+log = logging.getLogger(__name__)
 
 @dataclass
 class CommandResult:
@@ -70,6 +71,7 @@ class Repo:
         cmd: str,
         env: Optional[dict] = None,
     ) -> CommandResult:
+        log.debug("Running command", extra={"fields": {"cmd": cmd}})
         proc = subprocess.run(
             cmd,
             cwd=self.root,
@@ -78,11 +80,15 @@ class Repo:
             text=True,
             env=env,
         )
-        return CommandResult(
+        res = CommandResult(
             returncode=proc.returncode,
             stdout=proc.stdout,
             stderr=proc.stderr,
         )
+        if not res.ok:
+            log.warning("Command failed", extra={"fields": {"cmd": cmd, "returncode": res.returncode}})
+        return res
+    
 
     def run_tests(self, test_command: Optional[str]) -> CommandResult:
         if not test_command:
@@ -192,6 +198,7 @@ class Repo:
 
         ok, msg = self._diff_sanity_check(diff_text)
         if not ok:
+            log.warning("Diff sanity check failed", extra={"fields": {"reason": msg}})
             return CommandResult(returncode=2, stdout="", stderr=f"Invalid unified diff: {msg}")
 
         args = ["git", "apply", "--check", "--whitespace=nowarn", "--recount"]
@@ -230,6 +237,7 @@ class Repo:
 
         ok, msg = self._diff_sanity_check(diff_text)
         if not ok:
+            log.warning("Diff sanity check failed", extra={"fields": {"reason": msg}})
             return CommandResult(returncode=2, stdout="", stderr=f"Invalid unified diff: {msg}")
 
         check_res = self.check_unified_diff(diff_text)

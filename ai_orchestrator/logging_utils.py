@@ -1,156 +1,84 @@
 # ai_orchestrator/logging_utils.py
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
+import os
+import sys
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 
-@dataclass(frozen=True)
-class RunLogContext:
-    run_id: str
-    run_name: str
-    dry_run: bool
-    branch: Optional[str] = None
-
-
-class ContextAdapter(logging.LoggerAdapter):
+class JsonFormatter(logging.Formatter):
     """
-    Injects contextual fields into log records so every module can log with run/node/phase info.
+    Minimal JSON formatter. Keeps logs machine-parsable without external deps.
     """
-    def process(self, msg, kwargs):
-        extra = kwargs.get("extra", {})
-        merged = {**self.extra, **extra}
-        kwargs["extra"] = merged
-        return msg, kwargs
+
+    def format(self, record: logging.LogRecord) -> str:
+        base: Dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+
+        # Attach structured fields if provided via logger extra={"fields": {...}}
+        fields = getattr(record, "fields", None)
+        if isinstance(fields, dict):
+            base.update(fields)
+
+        if record.exc_info:
+            base["exc_info"] = self.formatException(record.exc_info)
+
+        return json.dumps(base, ensure_ascii=False)
 
 
-def _fmt() -> logging.Formatter:
-    # Keep readable + greppable
-    return logging.Formatter(
-        fmt="%(asctime)s %(levelname)s %(name)s | run=%(run_id)s node=%(node_id)s phase=%(phase)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-
-def _ensure_logrecord_defaults_installed() -> None:
-    """
-    Ensure formatter-required fields always exist, even for plain logging.getLogger(__name__)
-    calls without adapters. This prevents KeyError in the formatter.
-    """
-    if getattr(logging, "_ai_orchestrator_record_factory", None) is not None:
-        return
-
-    old_factory = logging.getLogRecordFactory()
-
-    def record_factory(*args, **kwargs):
-        record = old_factory(*args, **kwargs)
-        for k, v in {
-            "run_id": "-",
-            "run_name": "-",
-            "dry_run": False,
-            "branch": "",
-            "node_id": "-",
-            "phase": "-",
-        }.items():
-            if not hasattr(record, k):
-                setattr(record, k, v)
-        return record
-
-    logging.setLogRecordFactory(record_factory)
-    setattr(logging, "_ai_orchestrator_record_factory", record_factory)
-
-
-def init_run_logging(
+def setup_logging(
     *,
-    run_dir: Path,
-    level: str = "INFO",
+    level: Optional[str] = None,
+    json_logs: Optional[bool] = None,
 ) -> None:
     """
-    Process-wide logging setup.
-    - Console handler once
-    - A run-scoped file handler (run.log) for the run_dir
+    Central logging setup.
+
+    Env overrides:
+      - AO_LOG_LEVEL=INFO|DEBUG|WARNING|ERROR
+      - AO_LOG_JSON=1|0
     """
-    _ensure_logrecord_defaults_installed()
+    lvl = (level or os.getenv("AO_LOG_LEVEL") or "INFO").upper().strip()
+    use_json_env = os.getenv("AO_LOG_JSON")
+    if json_logs is None and use_json_env is not None:
+        json_logs = use_json_env.strip() in ("1", "true", "TRUE", "yes", "YES")
 
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, level.upper(), logging.INFO))
-    formatter = _fmt()
+    if json_logs is None:
+        json_logs = False
 
-    # Console (install once)
-    if not getattr(root, "_ai_orchestrator_console", False):
-        sh = logging.StreamHandler()
-        sh.setLevel(root.level)
-        sh.setFormatter(formatter)
-        root.addHandler(sh)
-        setattr(root, "_ai_orchestrator_console", True)
-
-    # Run file handler (install per run_dir if not already present)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    run_log_path = (run_dir / "run.log").resolve()
-
-    existing = getattr(root, "_ai_orchestrator_run_logs", set())
-    if str(run_log_path) not in existing:
-        fh = logging.FileHandler(run_log_path, encoding="utf-8")
-        fh.setLevel(root.level)
-        fh.setFormatter(formatter)
-        root.addHandler(fh)
-        existing.add(str(run_log_path))
-        setattr(root, "_ai_orchestrator_run_logs", existing)
-
-
-def make_logger(
-    name: str,
-    *,
-    run: RunLogContext,
-    node_id: str = "-",
-    phase: str = "-",
-) -> ContextAdapter:
-    base = logging.getLogger(name)
-    return ContextAdapter(
-        base,
-        {
-            "run_id": run.run_id,
-            "run_name": run.run_name,
-            "dry_run": run.dry_run,
-            "branch": run.branch or "",
-            "node_id": node_id,
-            "phase": phase,
-        },
-    )
-
-
-def add_node_file_handler(
-    *,
-    node_dir: Path,
-    level: Optional[int] = None,
-) -> logging.Handler:
-    """
-    Adds a file handler that captures everything (all modules) into node.log.
-
-    Returns the handler so the caller can remove it when the node finishes.
-    """
-    _ensure_logrecord_defaults_installed()
-
-    root = logging.getLogger()
-    formatter = _fmt()
-
-    node_dir.mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(node_dir / "node.log", encoding="utf-8")
-    fh.setLevel(level if level is not None else root.level)
-    fh.setFormatter(formatter)
-    root.addHandler(fh)
-    return fh
-
-
-def remove_handler(handler: logging.Handler) -> None:
-    root = logging.getLogger()
     try:
-        root.removeHandler(handler)
+        numeric = getattr(logging, lvl)
+        if not isinstance(numeric, int):
+            numeric = logging.INFO
     except Exception:
-        pass
-    try:
-        handler.close()
-    except Exception:
-        pass
+        numeric = logging.INFO
+
+    root = logging.getLogger()
+    root.setLevel(numeric)
+
+    # Replace handlers (avoid duplicate logs in repeated runs / unit tests)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    handler = logging.StreamHandler(sys.stdout)
+    if json_logs:
+        handler.setFormatter(JsonFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+
+    root.addHandler(handler)
+
+    # Quieten noisy libs if needed
+    logging.getLogger("openai").setLevel(max(numeric, logging.WARNING))

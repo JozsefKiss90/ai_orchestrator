@@ -8,7 +8,8 @@ from collections.abc import Mapping
 
 from openai import OpenAI
 
-
+import logging
+log = logging.getLogger(__name__)
 # ---- Schema registry ----
 # NOTE: For OpenAI Structured Outputs with strict=True, the server requires:
 # - schema.required must exist
@@ -162,6 +163,9 @@ class LLMClient:
         extra_kwargs: Optional[Dict[str, Any]] = None,
     ) -> str:
         kwargs = extra_kwargs or {}
+        log.info("LLM complete_text start", extra={"fields": {"model": self._config.model}})
+        log.debug("LLM prompts", extra={"fields": {"system_chars": len(system_prompt or ""), "user_chars": len(user_prompt or "")}})
+
         response = self._client.responses.create(
             model=self._config.model,
             input=[
@@ -254,6 +258,7 @@ class LLMClient:
                         )
 
                 rid = getattr(response, "id", None)
+                log.warning("LLM structured output empty; retrying once", extra={"fields": {"schema_name": schema_name}}),
                 raise RuntimeError(
                     "Model returned empty output for structured JSON twice via Responses API. "
                     f"response.id={rid!r} model={self._config.model!r}"
@@ -292,6 +297,7 @@ class LLMClient:
                 try:
                     return json.loads(raw_retry)
                 except json.JSONDecodeError as e2:
+                    log.warning("LLM returned invalid JSON; retrying once", extra={"fields": {"schema_name": schema_name, "error": str(e)}}),
                     raise RuntimeError(
                         f"Model returned invalid JSON twice: {e2}\nRaw output:\n{raw_retry}"
                     )

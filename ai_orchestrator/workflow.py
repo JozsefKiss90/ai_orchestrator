@@ -13,7 +13,9 @@ from .graph.types import DAG, Node
 from .graph.runner import DagRunner
 from .graph.planner import DagPlanner, PlannedDAGSpec, PlannedNodeSpec
 from .phases.scaffold import ScaffoldPhase
+import logging
 
+log = logging.getLogger(__name__)
 PHASE_REGISTRY: Dict[str, Type[Phase]] = {
     ScaffoldPhase.name: ScaffoldPhase,
     OopRefactorPhase.name: OopRefactorPhase,
@@ -39,7 +41,7 @@ class WorkflowRunner:
 
         # Default validators: tests if configured; else run the DAG defaults anyway
         default_validators = ["tests"]
-
+        
         return DAG(
             nodes=[
                 Node(
@@ -93,11 +95,14 @@ class WorkflowRunner:
         )
 
         planner = DagPlanner(phase_registry=PHASE_REGISTRY)
+    
         return planner.build(spec)
 
     def run_phase(self, phase_name: str, dry_run: bool = False, use_plan: bool = False) -> None:
         if use_plan:
             # Plan-first DAG
+            log.info("Building DAG", extra={"fields": {"use_plan": use_plan, "phase": phase_name}})
+
             dag = self._planned_dag(requested_phase=phase_name)
             run_name = f"plan-{phase_name}"
         else:
@@ -109,9 +114,13 @@ class WorkflowRunner:
 
         # Branch for safety (skip in dry-run)
         branch_name = f"ai/{run_name}"
+        log.info("Ensuring branch", extra={"fields": {"branch": branch_name, "dry_run": dry_run}})
+
         self._ensure_branch(branch_name, dry_run=dry_run)
 
         runner = DagRunner(cfg=self.cfg, repo=self.repo, llm=self.llm)
+        log.info("Executing DAG", extra={"fields": {"run_name": run_name, "commit_policy": dag.commit_policy, "dry_run": dry_run}})
+
         results = runner.execute(
             dag,
             run_name=run_name,
@@ -121,6 +130,8 @@ class WorkflowRunner:
 
         # Preserve prior behavior: print a summary and exit
         ok = all(r.ok for r in results)
+        log.info("DAG finished", extra={"fields": {"ok": ok, "run_name": run_name, "nodes": len(results)}})
+
         if ok:
             print("DAG run completed successfully.")
         else:

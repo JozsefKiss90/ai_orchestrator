@@ -7,7 +7,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import logging
 
+log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ContextPackLimits:
@@ -114,6 +116,23 @@ class ContextPackBuilder:
         }
 
         pack = self._enforce_total_size(pack)
+        try:
+            encoded_len = len(json.dumps(pack, ensure_ascii=False))
+        except Exception:
+            encoded_len = -1
+
+        log.info(
+            "Context pack persisted",
+            extra={"fields": {
+                "node_id": node_id,
+                "phase": phase_name,
+                "selected_files": len(selected_files),
+                "target_files": len(pack.get("meta", {}).get("target_files", []) or []),
+                "modules": len(pack.get("meta", {}).get("modules", []) or []),
+                "size_chars": encoded_len,
+                "node_dir": str(node_dir.relative_to(self.repo_root).as_posix()),
+            }},
+        )
 
         # Persist: per-node + run index + latest pointer
         (node_dir / "context_pack.json").write_text(
@@ -206,6 +225,16 @@ class ContextPackBuilder:
                     return cached
             except Exception:
                 pass
+
+        if cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                if cached.get("content_hash") == content_hash:
+                    log.debug("Module summary cache hit", extra={"fields": {"module": module_name}})
+                    return cached
+            except Exception:
+                pass
+        log.debug("Module summary cache miss", extra={"fields": {"module": module_name}})
 
         summary_text = self._summarize_module_deterministic(module_files)
 

@@ -16,6 +16,10 @@ from ..validators.types import PipelineResult, ValidatorSpec
 from ..phases.base import PhaseContext
 from .context import ContextPackBuilder
 from .types import DAG, Node, NodeResult
+import logging
+import time
+
+log = logging.getLogger(__name__)
 
 
 # Local schema: full-file fallback (new file creation without unified diffs).
@@ -53,6 +57,7 @@ class DagRunner:
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_dir = self.repo.root / ".ai-orchestrator" / "runs" / f"{run_id}-{run_name}"
         run_dir.mkdir(parents=True, exist_ok=True)
+        log.info("Initialized run dir", extra={"fields": {"run_id": run_id, "run_name": run_name, "run_dir": str(run_dir.relative_to(self.repo.root))}})
         return run_dir
 
     def _write_json(self, path: Path, obj: Any) -> None:
@@ -537,6 +542,15 @@ class DagRunner:
             self.repo.ensure_branch(branch_name)
 
         snapshot = self._git_snapshot()
+        log.info(
+            "Git snapshot",
+            extra={"fields": {
+                "head_sha": snapshot.get("head_sha"),
+                "branch": snapshot.get("branch"),
+                "dirty": snapshot.get("dirty"),
+            }},
+        )
+
         ctx_builder = ContextPackBuilder(repo_root=self.repo.root)
 
         run_meta = {
@@ -566,6 +580,9 @@ class DagRunner:
         last_failure_hints: Optional[Dict[str, Any]] = None
 
         for node in ordered:
+            node_t0 = time.time()
+            log.info("Node start", extra={"fields": {"node_id": node.id, "phase": node.phase_name, "deps": list(node.deps)}})
+
             node_dir = nodes_dir / node.id
             node_dir.mkdir(parents=True, exist_ok=True)
 
@@ -584,6 +601,11 @@ class DagRunner:
                 llm=self.llm,
                 ctx=ctx,
                 max_files=self.cfg.max_files_per_run,
+            )
+
+            log.info(
+                "Selected files",
+                extra={"fields": {"node_id": node.id, "phase": node.phase_name, "selected_count": len(selected)}},
             )
 
             self._write_json(
@@ -616,6 +638,18 @@ class DagRunner:
             ctx.state["context_pack"] = context_pack
             ctx.state["node_objective"] = getattr(node, "objective", "")
 
+            meta = (context_pack or {}).get("meta", {}) if isinstance(context_pack, dict) else {}
+            log.debug(
+                "Context pack built",
+                extra={"fields": {
+                    "node_id": node.id,
+                    "phase": node.phase_name,
+                    "selected_files": len(meta.get("selected_files", []) or []),
+                    "target_files": len(meta.get("target_files", []) or []),
+                    "modules": len(meta.get("modules", []) or []),
+                }},
+            )
+
             patches: List[Patch] = node.phase.generate_patches(
                 repo=self.repo,
                 files=selected,
@@ -630,6 +664,21 @@ class DagRunner:
                 )
             except Exception:
                 self._write_text(node_dir / "patches.txt", str(patches))
+
+
+            types = {"unified_diff": 0, "file_content": 0, "other": 0}
+            for p in patches:
+                if isinstance(p, UnifiedDiffPatch):
+                    types["unified_diff"] += 1
+                elif isinstance(p, FileContentPatch):
+                    types["file_content"] += 1
+                else:
+                    types["other"] += 1
+
+            log.info(
+                "Generated patches",
+                extra={"fields": {"node_id": node.id, "phase": node.phase_name, "patches": len(patches), **types}},
+            )
 
             if dry_run:
                 nr = NodeResult(
@@ -646,6 +695,10 @@ class DagRunner:
                 continue
 
             ok_apply, patches, msg_apply = self._apply_patches_with_repair(patches, node_dir)
+            log.info(
+                "Apply patches result",
+                extra={"fields": {"node_id": node.id, "phase": node.phase_name, "ok": bool(ok_apply), "applied_patches": len(patches)}},
+            )
             if not ok_apply:
                 nr = NodeResult(
                     node_id=node.id,
@@ -663,9 +716,24 @@ class DagRunner:
                     "failed_stage": "apply_patches",
                     "message": msg_apply,
                 }
+                log.error(
+                    "Node failed; stopping DAG",
+                    extra={"fields": {"node_id": node.id, "phase": node.phase_name, "failed_stage": last_failure_hints.get("failed_stage") if last_failure_hints else ""}},
+                )
                 break
 
             pipeline_result = self._run_validators(node_validators)
+            failed = next((r for r in pipeline_result.results if not r.ok), None)
+            log.info(
+                "Validators finished",
+                extra={"fields": {
+                    "node_id": node.id,
+                    "phase": node.phase_name,
+                    "ok": bool(pipeline_result.ok),
+                    "stopped_early": bool(pipeline_result.stopped_early),
+                    "failed_validator": (failed.name if failed else ""),
+                }},
+            )
             validator_json = ValidatorPipeline.to_json_dict(pipeline_result)
 
             self._write_json(node_dir / "validator_results.json", validator_json)
@@ -704,7 +772,9 @@ class DagRunner:
                 break
 
             if dag.commit_policy == "per_node" and node.commit:
+                log.info("Committing", extra={"fields": {"node_id": node.id, "phase": node.phase_name}})
                 self.repo.commit_all(f"[ai-orchestrator] {node.phase_name} (node {node.id})")
+
 
             nr = NodeResult(
                 node_id=node.id,
@@ -721,5 +791,9 @@ class DagRunner:
 
         if not dry_run and dag.commit_policy == "end" and all_ok:
             self.repo.commit_all(f"[ai-orchestrator] DAG run {run_name}")
+            log.info(
+                "Node end",
+                extra={"fields": {"node_id": node.id, "phase": node.phase_name, "ok": True, "duration_s": round(time.time() - node_t0, 3)}},
+            )
 
         return results
