@@ -17,7 +17,7 @@ build/
 # IDEs
 .vscode/
 .idea/
-
+.env
 # OS
 .DS_Store
 Thumbs.db
