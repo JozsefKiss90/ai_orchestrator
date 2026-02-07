@@ -57,6 +57,8 @@ def run_policy_validator(
         return dependency_boundaries(repo=repo, params=params)
     if name == "secrets_scan":
         return secrets_scan(repo=repo, params=params)
+    if name == "assert_text_contract":
+        return assert_text_contract(repo=repo, params=params)
 
     return ValidatorResult(
         name=name,
@@ -67,6 +69,80 @@ def run_policy_validator(
         duration_s=0.0,
     )
 
+def assert_text_contract(*, repo: Repo, params: Dict[str, Any]) -> ValidatorResult:
+    """
+    Generic text-based contract enforcement.
+
+    Params:
+      - contracts: list of objects:
+          - path: repo-relative file path
+          - require_all_regex: list[str] (all must match)
+          - require_any_regex: list[str] (at least one must match)
+          - message: str (optional failure hint)
+    """
+    import re
+    import time
+
+    t0 = time.time()
+    contracts = params.get("contracts") or []
+    if not isinstance(contracts, list) or not contracts:
+        return ValidatorResult(
+            name="assert_text_contract",
+            ok=False,
+            exit_code=2,
+            stdout="",
+            stderr="assert_text_contract: missing or invalid 'contracts' list in params",
+            duration_s=time.time() - t0,
+        )
+
+    failures = []
+    for c in contracts:
+        if not isinstance(c, dict):
+            failures.append("Invalid contract entry (not an object).")
+            continue
+
+        rp = str(c.get("path") or "").replace("\\", "/").strip()
+        msg = str(c.get("message") or "").strip()
+        all_rx = c.get("require_all_regex") or []
+        any_rx = c.get("require_any_regex") or []
+
+        if not rp:
+            failures.append("Contract missing 'path'.")
+            continue
+
+        p = repo.root / rp
+        if not p.exists():
+            failures.append(f"{rp}: file does not exist. {msg}".strip())
+            continue
+
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+
+        # All-of
+        if all_rx:
+            if not isinstance(all_rx, list) or not all(isinstance(x, str) for x in all_rx):
+                failures.append(f"{rp}: require_all_regex must be list[str].")
+            else:
+                for rx in all_rx:
+                    if not re.search(rx, txt, flags=re.MULTILINE):
+                        failures.append(f"{rp}: missing required pattern: {rx}. {msg}".strip())
+
+        # Any-of
+        if any_rx:
+            if not isinstance(any_rx, list) or not all(isinstance(x, str) for x in any_rx):
+                failures.append(f"{rp}: require_any_regex must be list[str].")
+            else:
+                if not any(re.search(rx, txt, flags=re.MULTILINE) for rx in any_rx):
+                    failures.append(f"{rp}: none of require_any_regex matched. {msg}".strip())
+
+    ok = len(failures) == 0
+    return ValidatorResult(
+        name="assert_text_contract",
+        ok=ok,
+        exit_code=0 if ok else 1,
+        stdout="All text contracts satisfied." if ok else "",
+        stderr="\n".join(failures) if not ok else "",
+        duration_s=time.time() - t0,
+    )
 
 def forbidden_imports(*, repo: Repo, params: Dict[str, Any]) -> ValidatorResult:
     rules = []

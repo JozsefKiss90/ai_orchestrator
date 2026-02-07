@@ -66,29 +66,45 @@ class Repo:
         return files
 
     # ---------- Commands ----------
-    def run_command(
-        self,
-        cmd: str,
-        env: Optional[dict] = None,
-    ) -> CommandResult:
-        log.debug("Running command", extra={"fields": {"cmd": cmd}})
-        proc = subprocess.run(
-            cmd,
-            cwd=self.root,
-            shell=True,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        res = CommandResult(
-            returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-        )
-        if not res.ok:
-            log.warning("Command failed", extra={"fields": {"cmd": cmd, "returncode": res.returncode}})
-        return res
-    
+    def run_command(self, cmd: str | List[str]) -> CommandResult:
+        """
+        Run a command in the repo root.
+
+        Accepts either:
+        - a string (legacy) -> executed via shell
+        - a list of argv tokens (preferred) -> executed without shell (safe)
+        """
+        import subprocess
+
+        try:
+            if isinstance(cmd, list):
+                # SAFE: no shell re-tokenization
+                p = subprocess.run(
+                    cmd,
+                    cwd=str(self.root),
+                    capture_output=True,
+                    text=True,
+                    shell=False,
+                )
+                res = CommandResult(p.returncode, p.stdout or "", p.stderr or "")
+            else:
+                # Legacy path: keep for now, but this is shell-fragile.
+                p = subprocess.run(
+                    cmd,
+                    cwd=str(self.root),
+                    capture_output=True,
+                    text=True,
+                    shell=True,
+                )
+                res = CommandResult(p.returncode, p.stdout or "", p.stderr or "")
+
+            if not res.ok:
+                log.warning("Command failed", extra={"fields": {"cmd": cmd, "returncode": res.returncode}})
+            return res
+        except Exception as e:
+            log.warning("Command failed", extra={"fields": {"cmd": cmd, "error": str(e)}})
+            return CommandResult(1, "", str(e))
+
 
     def run_tests(self, test_command: Optional[str]) -> CommandResult:
         if not test_command:
@@ -101,9 +117,8 @@ class Repo:
         return self.run_command(build_command)
 
     # ---------- Git helpers ----------
-    def git(self, args: Iterable[str]) -> CommandResult:
-        cmd = "git " + " ".join(args)
-        return self.run_command(cmd)
+    def git(self, args: List[str]) -> CommandResult:
+        return self.run_command(["git", *args])
 
     def ensure_branch(self, branch_name: str) -> None:
         branches = self.git(["branch", "--list"]).stdout
@@ -112,9 +127,21 @@ class Repo:
         else:
             self.git(["checkout", branch_name])
 
-    def commit_all(self, message: str) -> None:
-        self.git(["add", "."])
-        self.git(["commit", "-m", message])
+    def commit_all(self, message: str) -> CommandResult:
+        """
+        Stage all changes and commit.
+
+        Returns:
+        - If staging fails: staging result
+        - Else: commit result
+        """
+        add_res = self.git(["add", "."])
+        if not add_res.ok:
+            # Surface staging stderr (common source of 'pathspec' errors)
+            return add_res
+        return self.git(["commit", "-m", message])
+
+
 
     # ---------- Unified diff hardening ----------
 

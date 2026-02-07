@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..config import RepoConfig
 from ..llm import LLMClient, SCHEMA_REPAIR_UNIFIED_DIFF_V1
 from ..patching import FileContentPatch, Patch, UnifiedDiffPatch
-from ..repo import Repo
+from ..repo import Repo, CommandResult
 from ..validators.pipeline import ValidatorPipeline
 from ..validators.types import PipelineResult, ValidatorSpec
 from ..phases.base import PhaseContext
@@ -578,6 +578,7 @@ class DagRunner:
         all_ok = True
 
         last_failure_hints: Optional[Dict[str, Any]] = None
+        touched_paths: List[str] = []
 
         for node in ordered:
             node_t0 = time.time()
@@ -588,6 +589,12 @@ class DagRunner:
 
             node_validators = node.validators if node.validators else list(dag.default_validators)
             ctx = PhaseContext(phase_name=node.phase_name)
+
+            # Make objective available to select_files() and metadata logging
+            ctx.state["node_objective"] = getattr(node, "objective", "")
+
+            # Carry-forward touched paths for selection heuristics
+            ctx.state["touched_paths"] = list(touched_paths)
 
             all_files = self.repo.list_files(
                 include_globs=self.cfg.include_globs,
@@ -608,11 +615,38 @@ class DagRunner:
                 extra={"fields": {"node_id": node.id, "phase": node.phase_name, "selected_count": len(selected)}},
             )
 
+            selected_rel_files = [
+                p.relative_to(self.repo.root).as_posix()
+                for p in selected
+            ]
+
+            # Pull touched paths from context (upstream nodes) — DO NOT overwrite runner accumulator
+            ctx_touched = ctx.state.get("touched_paths") or []
+            if not isinstance(ctx_touched, list):
+                ctx_touched = []
+
+            # Normalize + de-duplicate for metadata clarity
+            seen = set()
+            touched_rel = []
+            for t in ctx_touched:
+                if not isinstance(t, str):
+                    continue
+                t = t.replace("\\", "/")
+                if t and t not in seen:
+                    seen.add(t)
+                    touched_rel.append(t)
+
             self._write_json(
                 node_dir / "selected_files.json",
-                {"files": [p.relative_to(self.repo.root).as_posix() for p in selected]},
+                {
+                    "selected_files": selected_rel_files,
+                    "touched_paths": touched_rel,
+                    "selection_reasoning": {
+                        "objective": ctx.state.get("node_objective", ""),
+                        "touched_paths_carried_forward": touched_rel,
+                    },
+                },
             )
-
             if not selected:
                 nr = NodeResult(
                     node_id=node.id,
@@ -721,6 +755,30 @@ class DagRunner:
                     extra={"fields": {"node_id": node.id, "phase": node.phase_name, "failed_stage": last_failure_hints.get("failed_stage") if last_failure_hints else ""}},
                 )
                 break
+            
+            # Carry forward touched paths for downstream nodes
+            new_touched: List[str] = []
+            for p in patches:
+                if isinstance(p, FileContentPatch):
+                    try:
+                        rp = p.path.relative_to(self.repo.root).as_posix()
+                        new_touched.append(rp)
+                    except Exception:
+                        pass
+                elif isinstance(p, UnifiedDiffPatch):
+                    new_touched.extend(self._extract_paths_from_diff(p.diff_text))
+
+            # Deduplicate, preserve order; keep list bounded
+            seen = set(touched_paths)
+            for rp in new_touched:
+                if rp and rp not in seen:
+                    seen.add(rp)
+                    touched_paths.append(rp)
+
+            # Cap to avoid unbounded growth (most-recent wins)
+            MAX_TOUCHED = 200
+            if len(touched_paths) > MAX_TOUCHED:
+                touched_paths = touched_paths[-MAX_TOUCHED:]
 
             pipeline_result = self._run_validators(node_validators)
             failed = next((r for r in pipeline_result.results if not r.ok), None)
@@ -773,7 +831,41 @@ class DagRunner:
 
             if dag.commit_policy == "per_node" and node.commit:
                 log.info("Committing", extra={"fields": {"node_id": node.id, "phase": node.phase_name}})
-                self.repo.commit_all(f"[ai-orchestrator] {node.phase_name} (node {node.id})")
+
+                add_res = self.repo.git(["add", "."])
+                commit_res = CommandResult(0, "", "")
+                if add_res.ok:
+                    commit_res = self.repo.git(["commit", "-m", f"{node.id}: {node.phase_name}"])
+
+                self._write_json(
+                    node_dir / "repo_commands.json",
+                    {
+                        "git_add": {
+                            "cmd": "git add .",
+                            "ok": add_res.ok,
+                            "returncode": add_res.returncode,
+                            "stdout": add_res.stdout,
+                            "stderr": add_res.stderr,
+                        },
+                        "git_commit": {
+                            "cmd": f'git commit -m "{node.id}: {node.phase_name}"',
+                            "ok": commit_res.ok,
+                            "returncode": commit_res.returncode,
+                            "stdout": commit_res.stdout,
+                            "stderr": commit_res.stderr,
+                        },
+                    },
+                )
+
+                if not add_res.ok:
+                    self._write_text(node_dir / "commit_error.txt", add_res.stderr or "")
+                elif not commit_res.ok:
+                    self._write_text(node_dir / "commit_error.txt", commit_res.stderr or "")
+
+
+                if not commit_res.ok:
+                    self._write_text(node_dir / "commit_error.txt", commit_res.stderr or "")
+
 
 
             nr = NodeResult(
