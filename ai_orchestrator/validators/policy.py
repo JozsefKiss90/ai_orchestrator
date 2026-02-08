@@ -78,7 +78,12 @@ def assert_text_contract(*, repo: Repo, params: Dict[str, Any]) -> ValidatorResu
           - path: repo-relative file path
           - require_all_regex: list[str] (all must match)
           - require_any_regex: list[str] (at least one must match)
+          - forbid_any_regex: list[str] (NONE must match)   <-- NEW (previously ignored)
           - message: str (optional failure hint)
+
+    Notes:
+      - All regex are applied with re.MULTILINE.
+      - forbid_any_regex is evaluated last so it can veto otherwise-satisfied contracts.
     """
     import re
     import time
@@ -95,7 +100,19 @@ def assert_text_contract(*, repo: Repo, params: Dict[str, Any]) -> ValidatorResu
             duration_s=time.time() - t0,
         )
 
-    failures = []
+    failures: List[str] = []
+
+    def _as_list_of_str(v: Any) -> List[str]:
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            return []
+        out: List[str] = []
+        for x in v:
+            if isinstance(x, str) and x.strip():
+                out.append(x)
+        return out
+
     for c in contracts:
         if not isinstance(c, dict):
             failures.append("Invalid contract entry (not an object).")
@@ -103,8 +120,10 @@ def assert_text_contract(*, repo: Repo, params: Dict[str, Any]) -> ValidatorResu
 
         rp = str(c.get("path") or "").replace("\\", "/").strip()
         msg = str(c.get("message") or "").strip()
-        all_rx = c.get("require_all_regex") or []
-        any_rx = c.get("require_any_regex") or []
+
+        all_rx = _as_list_of_str(c.get("require_all_regex"))
+        any_rx = _as_list_of_str(c.get("require_any_regex"))
+        forbid_rx = _as_list_of_str(c.get("forbid_any_regex"))
 
         if not rp:
             failures.append("Contract missing 'path'.")
@@ -117,32 +136,43 @@ def assert_text_contract(*, repo: Repo, params: Dict[str, Any]) -> ValidatorResu
 
         txt = p.read_text(encoding="utf-8", errors="ignore")
 
-        # All-of
-        if all_rx:
-            if not isinstance(all_rx, list) or not all(isinstance(x, str) for x in all_rx):
-                failures.append(f"{rp}: require_all_regex must be list[str].")
-            else:
-                for rx in all_rx:
-                    if not re.search(rx, txt, flags=re.MULTILINE):
-                        failures.append(f"{rp}: missing required pattern: {rx}. {msg}".strip())
+        # All-of: every pattern must match
+        if "require_all_regex" in c and not isinstance(c.get("require_all_regex"), list):
+            failures.append(f"{rp}: require_all_regex must be list[str].")
+        else:
+            for rx in all_rx:
+                if not re.search(rx, txt, flags=re.MULTILINE):
+                    failures.append(f"{rp}: missing required pattern: {rx}. {msg}".strip())
 
-        # Any-of
-        if any_rx:
-            if not isinstance(any_rx, list) or not all(isinstance(x, str) for x in any_rx):
-                failures.append(f"{rp}: require_any_regex must be list[str].")
-            else:
+        # Any-of: at least one must match (if provided)
+        if "require_any_regex" in c and not isinstance(c.get("require_any_regex"), list):
+            failures.append(f"{rp}: require_any_regex must be list[str].")
+        else:
+            if any_rx:
                 if not any(re.search(rx, txt, flags=re.MULTILINE) for rx in any_rx):
                     failures.append(f"{rp}: none of require_any_regex matched. {msg}".strip())
 
+        # Forbidden: none may match
+        if "forbid_any_regex" in c and not isinstance(c.get("forbid_any_regex"), list):
+            failures.append(f"{rp}: forbid_any_regex must be list[str].")
+        else:
+            for rx in forbid_rx:
+                if re.search(rx, txt, flags=re.MULTILINE):
+                    failures.append(f"{rp}: forbidden pattern matched: {rx}. {msg}".strip())
+
     ok = len(failures) == 0
+    stdout = "All text contracts satisfied." if ok else ""
+    stderr = "" if ok else "assert_text_contract failures:\n- " + "\n- ".join(failures)
+
     return ValidatorResult(
         name="assert_text_contract",
         ok=ok,
         exit_code=0 if ok else 1,
-        stdout="All text contracts satisfied." if ok else "",
-        stderr="\n".join(failures) if not ok else "",
+        stdout=stdout,
+        stderr=stderr,
         duration_s=time.time() - t0,
     )
+
 
 def forbidden_imports(*, repo: Repo, params: Dict[str, Any]) -> ValidatorResult:
     rules = []

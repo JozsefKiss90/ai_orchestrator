@@ -587,7 +587,27 @@ class DagRunner:
             node_dir = nodes_dir / node.id
             node_dir.mkdir(parents=True, exist_ok=True)
 
+            import re
+
+            def _filter_validators_for_node(node_validators, node_index_1based: int):
+                out = []
+                for v in node_validators:
+                    name = getattr(v, "name", "") or ""
+                    m = re.search(r"_phase(\d+)$", name)
+                    if not m:
+                        out.append(v)
+                        continue
+                    phase_n = int(m.group(1))
+                    if phase_n == node_index_1based:
+                        out.append(v)
+                return out
+
+            # inside execute() loop, you already have ordered nodes:
+            node_index_1based = 1 + ordered.index(node)
             node_validators = node.validators if node.validators else list(dag.default_validators)
+            node_validators = _filter_validators_for_node(node_validators, node_index_1based)
+
+
             ctx = PhaseContext(phase_name=node.phase_name)
 
             # Make objective available to select_files() and metadata logging
@@ -857,15 +877,10 @@ class DagRunner:
                     },
                 )
 
-                if not add_res.ok:
-                    self._write_text(node_dir / "commit_error.txt", add_res.stderr or "")
-                elif not commit_res.ok:
-                    self._write_text(node_dir / "commit_error.txt", commit_res.stderr or "")
-
-
-                if not commit_res.ok:
-                    self._write_text(node_dir / "commit_error.txt", commit_res.stderr or "")
-
+            if not add_res.ok:
+                self._write_text(node_dir / "commit_error.txt", (add_res.stderr or add_res.stdout or "").strip())
+            elif not commit_res.ok:
+                self._write_text(node_dir / "commit_error.txt", (commit_res.stderr or commit_res.stdout or "").strip())
 
 
             nr = NodeResult(

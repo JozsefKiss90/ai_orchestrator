@@ -72,19 +72,68 @@ class WorkflowRunner:
             available_validators=available_validators,
         )
 
+        # --------------------------
+        # HARDEN: sanitize + enforce
+        # --------------------------
+        known = set(available_validators)
+
+        def _only_known(xs: object) -> List[str]:
+            if not isinstance(xs, list):
+                return []
+            out: List[str] = []
+            seen = set()
+            for x in xs:
+                if not isinstance(x, str):
+                    continue
+                if x not in known:
+                    continue
+                if x not in seen:
+                    seen.add(x)
+                    out.append(x)
+            return out
+
+        # Naming convention: repo-provided goal contracts
+        contract_validators = sorted([v for v in available_validators if isinstance(v, str) and v.startswith("goal_contract")])
+
+        # Baseline: always run tests if present
+        tests_only: List[str] = ["tests"] if "tests" in known else []
+        refactor_validators: List[str] = tests_only + contract_validators
+
         commit_policy = plan_json.get("commit_policy", "per_node")
-        default_validators = plan_json.get("default_validators", ["tests"])
         nodes_json = plan_json.get("nodes", [])
+
+        # Default validators: always refactor set (tests + contracts) for safety
+        default_validators = _only_known(plan_json.get("default_validators", [])) or list(refactor_validators)
 
         spec_nodes: List[PlannedNodeSpec] = []
         for n in nodes_json:
+            node_id = str(n.get("id", "") or "")
+            phase = str(n.get("phase", "") or "")
+            deps = list(n.get("deps", []) or [])
+            obj = str(n.get("objective", "") or "")
+
+            # Start with planner-provided validators, but sanitize.
+            node_validators = _only_known(n.get("validators", []))
+
+            # Enforce deterministic gating:
+            # - scaffold node(s): tests only
+            # - oop_refactor / verify nodes: tests + goal_contract*
+            if phase == "scaffold":
+                node_validators = list(tests_only)
+            elif phase == "oop_refactor":
+                node_validators = list(refactor_validators)
+            else:
+                # Any other phase: if planner omitted validators, fall back to default.
+                if not node_validators:
+                    node_validators = list(default_validators)
+
             spec_nodes.append(
                 PlannedNodeSpec(
-                    id=n["id"],
-                    phase=n["phase"],
-                    deps=list(n.get("deps", [])),
-                    validators=list(n.get("validators", [])),
-                    objective=str(n.get("objective", "") or ""),
+                    id=node_id,
+                    phase=phase,
+                    deps=deps,
+                    validators=node_validators,
+                    objective=obj,
                 )
             )
 
@@ -95,8 +144,8 @@ class WorkflowRunner:
         )
 
         planner = DagPlanner(phase_registry=PHASE_REGISTRY)
-    
         return planner.build(spec)
+
 
     def run_phase(self, phase_name: str, dry_run: bool = False, use_plan: bool = False) -> None:
         if use_plan:

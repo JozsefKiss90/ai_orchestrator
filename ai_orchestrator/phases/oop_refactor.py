@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import List, Set
 
 from .base import Phase, PhaseContext
-from ..llm import LLMClient, SCHEMA_UNIFIED_DIFF_V1, SCHEMA_FILE_CONTENT_V1
-from ..patching import Patch, UnifiedDiffPatch
-from ..patching import FileContentPatch
+from ..llm import LLMClient, SCHEMA_FILE_CONTENT_V1
+from ..patching import Patch, FileContentPatch
 
 
 class OopRefactorPhase(Phase):
@@ -21,13 +20,13 @@ class OopRefactorPhase(Phase):
         ctx: PhaseContext,
     ) -> List[Patch]:
         """
-        Robust mode: return full file contents only (no unified diffs inside JSON).
-        This avoids invalid JSON due to raw newlines in diff strings.
+        Robust mode: return full file contents only.
 
-        Behavior:
-          - If node objective says "validators only", emit no patches.
-          - Otherwise, update existing files by returning full new contents.
-          - May create new files by returning full contents as well.
+        HARD SAFETY:
+          - Only emit patches for:
+              (a) repo-relative paths that are in SELECTED FILES, OR
+              (b) repo-relative paths explicitly mentioned in docs/ORCHESTRATOR_GOAL.md
+          - This prevents planner/objective hallucinations from creating new files.
         """
         system_prompt = (
             "You are a senior software engineer.\n"
@@ -35,11 +34,39 @@ class OopRefactorPhase(Phase):
             "Do not include markdown fences.\n"
         )
 
-        objective = (ctx.state.get("node_objective") or "").strip().lower()
+        objective_raw = str(ctx.state.get("node_objective") or "")
+        objective = objective_raw.strip().lower()
+
+        # Verification-only node: no patches
         if "validators only" in objective or "run validators only" in objective or "tests-only" in objective:
             return []
 
-        # Build context blobs
+        # ---- Allowlist computation ----
+        selected_rel_paths: List[str] = [p.relative_to(repo.root).as_posix() for p in files]
+        selected_set: Set[str] = set(selected_rel_paths)
+
+        goal_allow: Set[str] = set()
+        goal_rel = "docs/ORCHESTRATOR_GOAL.md"
+        goal_path = repo.root / goal_rel
+        if goal_path.exists():
+            import re
+
+            txt = goal_path.read_text(encoding="utf-8", errors="ignore")
+            # conservative path extractor: tokens containing at least one "/" or "\".
+            candidates = re.findall(r"(?<!\w)([A-Za-z0-9_.\-]+(?:[\\/][A-Za-z0-9_.\-]+)+)(?!\w)", txt)
+            for c in candidates:
+                rp = c.replace("\\", "/").strip().strip("\"'`").rstrip(").,;:")
+                if rp.startswith("./"):
+                    rp = rp[2:]
+                # reject traversal/absolute
+                p = Path(rp)
+                if p.is_absolute() or ".." in p.parts or (p.parts and p.parts[0].endswith(":")):
+                    continue
+                goal_allow.add(p.as_posix())
+
+        allowed_paths: Set[str] = set(selected_set) | set(goal_allow)
+
+        # ---- Build context blobs (as before) ----
         context_pack = ctx.state.get("context_pack")
         constraints_blob = ""
         module_summaries_blob = ""
@@ -58,37 +85,30 @@ class OopRefactorPhase(Phase):
                     if isinstance(m, dict)
                 )
 
-        # Files given to the phase (selected)
         file_blobs = []
-        selected_rel_paths: List[str] = []
         for path in files:
             rel = path.relative_to(repo.root).as_posix()
-            selected_rel_paths.append(rel)
             content = path.read_text(encoding="utf-8", errors="ignore")
-            file_blobs.append(
-                f"// FILE: {rel}\n"
-                "```code\n"
-                f"{content}\n"
-                "```"
-            )
+            file_blobs.append(f"// FILE: {rel}\n```code\n{content}\n```")
 
         user_prompt = (
             "TASK:\n"
-            "- Apply minimal OOP refactoring if required by the goal.\n"
-            "- Implement the current NODE OBJECTIVE precisely.\n"
-            "- Preserve behavior: running `python hello.py` must print exactly `hello world`.\n\n"
+            "- Apply OOP refactoring if required by the goal.\n"
+            "- Implement the current NODE OBJECTIVE precisely.\n\n"
             "OUTPUT FORMAT:\n"
-            "Return JSON: { \"files\": [ {\"path\": string, \"new_content\": string}, ... ] }\n\n"
+            'Return JSON: { "files": [ {"path": string, "new_content": string}, ... ] }\n\n'
             "Rules:\n"
-            "- You may edit ONLY files listed in SELECTED FILES unless you are explicitly creating a new file required by the goal.\n"
+            "- You may edit ONLY files listed in SELECTED FILES.\n"
+            "- You may create/modify additional files ONLY if they are explicitly mentioned in docs/ORCHESTRATOR_GOAL.md.\n"
             "- For any file you edit, return its COMPLETE new content.\n"
-            "- For any new file you create, return its COMPLETE content.\n"
             "- Paths must be repo-relative (use forward slashes).\n\n"
+            "HARD ALLOWLIST (do not output paths outside this set):\n"
+            + "\n".join(f"- {p}" for p in sorted(allowed_paths))
+            + "\n\n"
         )
 
-        if objective:
-            user_prompt += f"NODE OBJECTIVE:\n{objective}\n\n"
-
+        if objective_raw.strip():
+            user_prompt += f"NODE OBJECTIVE:\n{objective_raw}\n\n"
         if constraints_blob:
             user_prompt += constraints_blob + "\n\n"
         if module_summaries_blob:
@@ -110,11 +130,14 @@ class OopRefactorPhase(Phase):
             new_content = item.get("new_content")
             if not rp or new_content is None:
                 continue
+
+            # HARD BLOCK hallucinations
+            if rp not in allowed_paths:
+                continue
+
             patches.append(FileContentPatch(path=repo.root / rp, new_content=str(new_content)))
 
         return patches
-
-
 
     def select_files(
         self,
@@ -125,37 +148,27 @@ class OopRefactorPhase(Phase):
         max_files: int,
     ) -> List[Path]:
         """
-        Dynamic selection (no hard-coded filenames):
-
-        - Extract repo-relative paths mentioned in ctx.state["node_objective"].
-        - Prepend ctx.state["touched_paths"] (carried forward by the runner).
-        - Fill remaining budget using a capped relevance score across repo files.
+        Keep your existing dynamic selection logic unchanged.
+        (This file is a full replacement, but selection remains identical to your prior version.)
         """
+        # Import the existing implementation from your current file if you want,
+        # but for "full replacement" we inline it by reusing the exact prior code.
         import re
 
         max_files = max(1, int(max_files))
 
-        # ---------- helpers ----------
-
         def _normalize_relpath(s: str) -> str:
             s = s.strip().strip("\"'`")
             s = s.replace("\\", "/")
-            # Trim trailing punctuation often attached in prose.
             s = s.rstrip(").,;:")
-            # Remove leading ./ for consistency.
             if s.startswith("./"):
                 s = s[2:]
             return s
 
         def _safe_repo_relpath(s: str) -> str | None:
-            """
-            Reject absolute paths, drive letters, parent traversal.
-            Return normalized posix relpath if safe.
-            """
             s = _normalize_relpath(s)
             if not s:
                 return None
-            # reject URLs
             if "://" in s:
                 return None
             p = Path(s)
@@ -168,18 +181,8 @@ class OopRefactorPhase(Phase):
             return Path(p.as_posix()).as_posix()
 
         def _extract_paths_from_objective(text: str) -> List[str]:
-            """
-            Extract likely file paths from free text.
-            Examples captured:
-            - app/config.py
-            - docs/goals/ORCHESTRATOR_GOAL_FILE_CREATION.md
-            - tests/test_greeter.py
-            """
             if not text:
                 return []
-
-            # Match tokens that contain at least one slash/backslash and some filename chars.
-            # Avoid eating whole sentences; keep it conservative.
             candidates = re.findall(r"(?<!\w)([A-Za-z0-9_.\-]+(?:[\\/][A-Za-z0-9_.\-]+)+)(?!\w)", text)
             out: List[str] = []
             seen = set()
@@ -193,57 +196,35 @@ class OopRefactorPhase(Phase):
             return out
 
         def _score_candidate(p: Path, *, obj_tokens: set[str], obj_paths: set[str], touched: set[str]) -> int:
-            """
-            Capped relevance heuristic:
-            - objective-mentioned paths highest
-            - touched paths next
-            - python files preferred
-            - token overlap bonus
-            - directory proximity bonus
-            """
             rel = p.relative_to(repo.root).as_posix()
             name = p.name.lower()
             parts = {seg.lower() for seg in Path(rel).parts}
-
             score = 0
             if rel in obj_paths:
                 score += 1000
             if rel in touched:
                 score += 800
-
-            # Prefer code, but don't exclude docs/tests/etc.
             if p.suffix == ".py":
                 score += 50
             elif p.suffix in {".md", ".json", ".yaml", ".yml"}:
                 score += 10
-
-            # Token overlap (cheap “semantic” signal)
             score += 5 * len((parts | {name}) & obj_tokens)
-
-            # Directory proximity: if candidate shares a directory segment with objective paths
             for op in obj_paths:
-                op_parts = {seg.lower() for seg in Path(op).parts[:-1]}  # directory parts only
+                op_parts = {seg.lower() for seg in Path(op).parts[:-1]}
                 if op_parts and (op_parts & parts):
                     score += 15
                     break
-
-            # Small bump for top-level entrypoints (still not hard-coded names)
             if len(Path(rel).parts) == 1 and p.suffix == ".py":
                 score += 10
-
             return score
-
-        # ---------- build priority sets ----------
 
         objective = str(ctx.state.get("node_objective") or "")
         obj_paths_list = _extract_paths_from_objective(objective)
 
-        # Touched paths from previous nodes (injected by runner)
         touched_list = ctx.state.get("touched_paths") or []
         if not isinstance(touched_list, list):
             touched_list = []
 
-        # Normalize touched paths
         touched_norm: List[str] = []
         seen = set()
         for t in touched_list:
@@ -258,11 +239,8 @@ class OopRefactorPhase(Phase):
 
         obj_paths = set(obj_paths_list)
         touched = set(touched_norm)
-
-        # Tokenize objective for relevance fill
         obj_tokens = {tok.lower() for tok in re.findall(r"[A-Za-z0-9_.\-]+", objective) if tok}
 
-        # ---------- select ----------
         selected: List[Path] = []
         selected_rel: set[str] = set()
 
@@ -277,19 +255,15 @@ class OopRefactorPhase(Phase):
             selected.append(p)
             selected_rel.add(rp)
 
-        # 1) Always include objective paths (if they exist)
         for rp in obj_paths_list:
             _try_add_rel(rp)
 
-        # 2) Then include touched paths from upstream nodes
         for rp in touched_norm:
             _try_add_rel(rp)
 
         if len(selected) >= max_files:
             return selected[:max_files]
 
-        # 3) Capped relevance fill across repo files
-        # Score all files once; then take highest-scoring not already selected
         scored = []
         for p in files:
             if not p.is_file():
@@ -297,9 +271,9 @@ class OopRefactorPhase(Phase):
             rel = p.relative_to(repo.root).as_posix()
             if rel in selected_rel:
                 continue
-            scored.append(( _score_candidate(p, obj_tokens=obj_tokens, obj_paths=obj_paths, touched=touched), rel, p))
+            scored.append((_score_candidate(p, obj_tokens=obj_tokens, obj_paths=obj_paths, touched=touched), rel, p))
 
-        scored.sort(key=lambda x: (-x[0], x[1]))  # score desc, then path asc for determinism
+        scored.sort(key=lambda x: (-x[0], x[1]))
         for _, rel, p in scored:
             if len(selected) >= max_files:
                 break
@@ -307,5 +281,3 @@ class OopRefactorPhase(Phase):
             selected_rel.add(rel)
 
         return selected[:max_files]
-
-
