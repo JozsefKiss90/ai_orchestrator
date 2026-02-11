@@ -18,6 +18,7 @@ from .context import ContextPackBuilder
 from .types import DAG, Node, NodeResult
 import logging
 import time
+import re
 
 log = logging.getLogger(__name__)
 
@@ -326,6 +327,39 @@ class DagRunner:
         # Normalize
         return Path(p.as_posix())
 
+    def _extract_repo_paths_from_objective(self, text: str) -> List[str]:
+        """
+        Best-effort extraction of repo-relative paths from a node objective.
+
+        We intentionally accept non-existent paths because scaffold can create them.
+        Safety is enforced by _safe_relpath() (no abs paths, no traversal, no drive letters).
+        """
+        if not text:
+            return []
+
+        # Match things like:
+        #   demo-hello/app_facade.py
+        #   docs/architecture.puml
+        # Avoid matching single tokens like "@file". Require at least one slash.
+        candidates = re.findall(
+            r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)(?![A-Za-z0-9_.-])",
+            text,
+        )
+
+        out: List[str] = []
+        seen = set()
+        for c in candidates:
+            c = (c or "").strip().replace("\\", "/")
+            if not c or c.lower() == "@file":
+                continue
+            rp = self._safe_relpath(c)
+            if rp is None:
+                continue
+            s = rp.as_posix()
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
     def _apply_patches_with_repair(
         self,
         patches: List[Patch],
@@ -593,6 +627,11 @@ class DagRunner:
                 out = []
                 for v in node_validators:
                     name = getattr(v, "name", "") or ""
+                    # node_validators can be a list[str] (names) or a list[ValidatorSpec].
+                    if isinstance(v, str):
+                        name = v
+                    else:
+                        name = getattr(v, "name", "") or ""
                     m = re.search(r"_phase(\d+)$", name)
                     if not m:
                         out.append(v)
@@ -621,6 +660,24 @@ class DagRunner:
                 exclude_globs=self.cfg.exclude_globs,
             )
             all_files = sorted(all_files, key=lambda p: p.relative_to(self.repo.root).as_posix())
+
+            # ------------------------------------------------------------
+            # IMPORTANT: allow creation targets to participate in selection
+            # ------------------------------------------------------------
+            # repo.list_files() returns only existing files; scaffold needs to be
+            # able to "select" files that do not exist yet, so it can create them.
+            # We therefore inject repo-relative paths mentioned in the node objective
+            # as candidate Path objects (even if missing on disk).
+            objective = ctx.state.get("node_objective", "") or ""
+            objective_paths = self._extract_repo_paths_from_objective(str(objective))
+            if objective_paths:
+                existing_rel = {p.relative_to(self.repo.root).as_posix() for p in all_files}
+                for rp in objective_paths:
+                    if rp in existing_rel:
+                        continue
+                    all_files.append(self.repo.root / rp)
+                # Keep deterministic ordering for selection heuristics / logging
+                all_files = sorted(all_files, key=lambda p: p.relative_to(self.repo.root).as_posix())
 
             selected = node.phase.select_files(
                 repo=self.repo,
@@ -667,7 +724,7 @@ class DagRunner:
                     },
                 },
             )
-            if not selected:
+            if not selected and node.phase_name != "scaffold":
                 nr = NodeResult(
                     node_id=node.id,
                     ok=True,

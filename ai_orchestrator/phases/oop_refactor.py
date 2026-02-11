@@ -1,8 +1,9 @@
 # ai_orchestrator/phases/oop_refactor.py
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 from .base import Phase, PhaseContext
 from ..llm import LLMClient, SCHEMA_FILE_CONTENT_V1
@@ -11,6 +12,62 @@ from ..patching import Patch, FileContentPatch
 
 class OopRefactorPhase(Phase):
     name = "oop_refactor"
+
+    def _load_contract_hints(self, repo) -> Dict[str, Dict[str, List[str]]]:
+        """
+        Returns mapping:
+          path -> { "require_all_regex": [...], "require_any_regex": [...], "forbid_any_regex": [...] }
+
+        We intentionally keep this generic: it just mirrors the policy config.
+        """
+        cfg_path = repo.root / ".ai-orchestrator.json"
+        if not cfg_path.exists():
+            return {}
+
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8", errors="ignore") or "{}")
+        except Exception:
+            return {}
+
+        validators = cfg.get("validators")
+        if not isinstance(validators, list):
+            return {}
+
+        out: Dict[str, Dict[str, List[str]]] = {}
+        for v in validators:
+            if not isinstance(v, dict):
+                continue
+            if v.get("kind") != "policy":
+                continue
+            if v.get("policy") != "assert_text_contract":
+                continue
+            params = v.get("params") or {}
+            if not isinstance(params, dict):
+                continue
+            contracts = params.get("contracts")
+            if not isinstance(contracts, list):
+                continue
+
+            for c in contracts:
+                if not isinstance(c, dict):
+                    continue
+                path = c.get("path")
+                if not isinstance(path, str) or not path.strip():
+                    continue
+
+                def _lst(key: str) -> List[str]:
+                    val = c.get(key)
+                    if not isinstance(val, list):
+                        return []
+                    return [x for x in val if isinstance(x, str) and x.strip()]
+
+                out[path] = {
+                    "require_all_regex": _lst("require_all_regex"),
+                    "require_any_regex": _lst("require_any_regex"),
+                    "forbid_any_regex": _lst("forbid_any_regex"),
+                }
+
+        return out
 
     def generate_patches(
         self,
@@ -26,7 +83,6 @@ class OopRefactorPhase(Phase):
           - Only emit patches for:
               (a) repo-relative paths that are in SELECTED FILES, OR
               (b) repo-relative paths explicitly mentioned in docs/ORCHESTRATOR_GOAL.md
-          - This prevents planner/objective hallucinations from creating new files.
         """
         system_prompt = (
             "You are a senior software engineer.\n"
@@ -35,10 +91,10 @@ class OopRefactorPhase(Phase):
         )
 
         objective_raw = str(ctx.state.get("node_objective") or "")
-        objective = objective_raw.strip().lower()
+        objective_lc = objective_raw.strip().lower()
 
         # Verification-only node: no patches
-        if "validators only" in objective or "run validators only" in objective or "tests-only" in objective:
+        if "validators only" in objective_lc or "run validators only" in objective_lc or "tests-only" in objective_lc:
             return []
 
         # ---- Allowlist computation ----
@@ -52,19 +108,20 @@ class OopRefactorPhase(Phase):
             import re
 
             txt = goal_path.read_text(encoding="utf-8", errors="ignore")
-            # conservative path extractor: tokens containing at least one "/" or "\".
             candidates = re.findall(r"(?<!\w)([A-Za-z0-9_.\-]+(?:[\\/][A-Za-z0-9_.\-]+)+)(?!\w)", txt)
             for c in candidates:
                 rp = c.replace("\\", "/").strip().strip("\"'`").rstrip(").,;:")
                 if rp.startswith("./"):
                     rp = rp[2:]
-                # reject traversal/absolute
                 p = Path(rp)
                 if p.is_absolute() or ".." in p.parts or (p.parts and p.parts[0].endswith(":")):
                     continue
                 goal_allow.add(p.as_posix())
 
         allowed_paths: Set[str] = set(selected_set) | set(goal_allow)
+
+        # ---- Contract hints (from validators) ----
+        contract_hints = self._load_contract_hints(repo)
 
         # ---- Build context blobs (as before) ----
         context_pack = ctx.state.get("context_pack")
@@ -91,10 +148,36 @@ class OopRefactorPhase(Phase):
             content = path.read_text(encoding="utf-8", errors="ignore")
             file_blobs.append(f"// FILE: {rel}\n```code\n{content}\n```")
 
+        # ---- Add contract anchors to the prompt (key reliability improvement) ----
+        contract_blob_lines: List[str] = []
+        for rp in selected_rel_paths:
+            hints = contract_hints.get(rp)
+            if not hints:
+                continue
+            req_all = hints.get("require_all_regex") or []
+            req_any = hints.get("require_any_regex") or []
+            forb = hints.get("forbid_any_regex") or []
+
+            contract_blob_lines.append(f"### CONTRACT FOR {rp}")
+            if req_all:
+                contract_blob_lines.append("MUST match ALL of these regexes:")
+                contract_blob_lines.extend([f"- {r}" for r in req_all])
+            if req_any:
+                contract_blob_lines.append("MUST match AT LEAST ONE of these regexes:")
+                contract_blob_lines.extend([f"- {r}" for r in req_any])
+            if forb:
+                contract_blob_lines.append("MUST NOT match ANY of these regexes:")
+                contract_blob_lines.extend([f"- {r}" for r in forb])
+            contract_blob_lines.append("")
+
+        contract_blob = ""
+        if contract_blob_lines:
+            contract_blob = "VALIDATOR CONTRACTS (you MUST satisfy these exactly):\n" + "\n".join(contract_blob_lines)
+
         user_prompt = (
             "TASK:\n"
-            "- Apply OOP refactoring if required by the goal.\n"
-            "- Implement the current NODE OBJECTIVE precisely.\n\n"
+            "- Implement the current NODE OBJECTIVE precisely.\n"
+            "- Ensure the resulting code satisfies the VALIDATOR CONTRACTS exactly.\n\n"
             "OUTPUT FORMAT:\n"
             'Return JSON: { "files": [ {"path": string, "new_content": string}, ... ] }\n\n'
             "Rules:\n"
@@ -109,6 +192,8 @@ class OopRefactorPhase(Phase):
 
         if objective_raw.strip():
             user_prompt += f"NODE OBJECTIVE:\n{objective_raw}\n\n"
+        if contract_blob:
+            user_prompt += contract_blob + "\n\n"
         if constraints_blob:
             user_prompt += constraints_blob + "\n\n"
         if module_summaries_blob:
@@ -130,11 +215,8 @@ class OopRefactorPhase(Phase):
             new_content = item.get("new_content")
             if not rp or new_content is None:
                 continue
-
-            # HARD BLOCK hallucinations
             if rp not in allowed_paths:
                 continue
-
             patches.append(FileContentPatch(path=repo.root / rp, new_content=str(new_content)))
 
         return patches
@@ -147,12 +229,7 @@ class OopRefactorPhase(Phase):
         ctx: PhaseContext,
         max_files: int,
     ) -> List[Path]:
-        """
-        Keep your existing dynamic selection logic unchanged.
-        (This file is a full replacement, but selection remains identical to your prior version.)
-        """
-        # Import the existing implementation from your current file if you want,
-        # but for "full replacement" we inline it by reusing the exact prior code.
+        # Keep your existing selection logic exactly as-is (unchanged)
         import re
 
         max_files = max(1, int(max_files))

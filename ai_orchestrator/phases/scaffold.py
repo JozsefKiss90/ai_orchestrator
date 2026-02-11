@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
+import re
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
 
 from .base import Phase, PhaseContext
 from ..llm import LLMClient
 from ..patching import Patch, FileContentPatch
-
 
 SCHEMA_SCAFFOLD_V1: Dict[str, Any] = {
     "type": "object",
@@ -17,10 +18,7 @@ SCHEMA_SCAFFOLD_V1: Dict[str, Any] = {
             "type": "array",
             "items": {
                 "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                },
+                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                 "required": ["path", "content"],
                 "additionalProperties": False,
             },
@@ -39,14 +37,12 @@ class ScaffoldPhase(Phase):
     Project-agnostic enforcement:
       - Reads repo-local `.ai-orchestrator.json` (the orchestrated repo contract).
       - Enforces `phase_rules.scaffold.create_only` and `phase_rules.scaffold.modify_allow` if present.
+      - Treats PlantUML '@file <path>' mappings as normative file targets.
     """
+
     name = "scaffold"
 
     def _load_phase_rules(self, repo) -> Tuple[Set[str], Set[str]]:
-        """
-        Returns (create_only, modify_allow) as normalized repo-relative POSIX paths.
-        Missing keys => empty sets (meaning "no allowlist specified").
-        """
         cfg_path = repo.root / ".ai-orchestrator.json"
         if not cfg_path.exists():
             return set(), set()
@@ -91,10 +87,6 @@ class ScaffoldPhase(Phase):
 
     @staticmethod
     def _safe_repo_relpath(s: str) -> Optional[str]:
-        """
-        Validate and normalize a repo-relative path string.
-        Reject absolute paths, drive letters, and parent traversal.
-        """
         if not s:
             return None
         if "://" in s:
@@ -102,12 +94,73 @@ class ScaffoldPhase(Phase):
         p = Path(s)
         if p.is_absolute():
             return None
-        # Windows drive-letter like "C:..."
         if len(p.parts) > 0 and p.parts[0].endswith(":"):
             return None
         if ".." in p.parts:
             return None
         return Path(p.as_posix()).as_posix()
+
+    @staticmethod
+    def _parse_puml_file_map(puml_text: str) -> Dict[str, List[str]]:
+        """
+        Extract mapping: repo_rel_path -> list of class/interface names.
+        Convention:
+          class Foo { ... }
+          note top of Foo
+            @file path/to/file.py
+          end note
+        """
+        mapping: DefaultDict[str, List[str]] = defaultdict(list)
+        in_note_for_symbol: Optional[str] = None
+
+        for raw in (puml_text or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("'"):
+                continue
+
+            m_note = re.match(r"^note\s+top\s+of\s+([A-Za-z_][A-Za-z0-9_]*)\b", line)
+            if m_note:
+                in_note_for_symbol = m_note.group(1)
+                continue
+
+            if line.lower() == "end note":
+                in_note_for_symbol = None
+                continue
+
+            if in_note_for_symbol:
+                m_file = re.search(r"@file\s+(.+)$", line)
+                if m_file:
+                    rp = ScaffoldPhase._normalize_relpath(m_file.group(1))
+                    rp = ScaffoldPhase._safe_repo_relpath(rp) or ""
+                    if rp:
+                        mapping[rp].append(in_note_for_symbol)
+
+        return dict(mapping)
+
+    @staticmethod
+    def _skeleton_for(path_rel: str, symbols: List[str]) -> str:
+        header = [
+            '"""',
+            f"Auto-generated scaffold for: {path_rel}",
+            "Generated from PlantUML @file mappings.",
+            '"""',
+            "",
+            "from __future__ import annotations",
+            "",
+        ]
+        body: List[str] = []
+        for sym in symbols:
+            body.extend(
+                [
+                    f"class {sym}:",
+                    "    def __init__(self, *args, **kwargs):",
+                    "        pass",
+                    "",
+                ]
+            )
+        if not body:
+            body = ["# TODO: implement", ""]
+        return "\n".join(header + body)
 
     def generate_patches(
         self,
@@ -116,17 +169,6 @@ class ScaffoldPhase(Phase):
         llm: LLMClient,
         ctx: PhaseContext,
     ) -> List[Patch]:
-        """
-        Goal-driven scaffolding.
-
-        - No hard-coded file names in pipeline.
-        - Create/modify only files explicitly required by NODE OBJECTIVE and/or repo goal doc.
-        - Enforce repo-declared allowlists for this phase via `.ai-orchestrator.json`:
-            phase_rules.scaffold.create_only
-            phase_rules.scaffold.modify_allow
-        """
-        import re
-
         objective = str(ctx.state.get("node_objective") or "").strip()
 
         goal_rel = "docs/ORCHESTRATOR_GOAL.md"
@@ -151,23 +193,55 @@ class ScaffoldPhase(Phase):
                     out.append(rp)
             return out
 
-        # Mentioned paths (objective + goal). We never allow creation outside this set.
-        mentioned = sorted(set(extract_paths(objective) + extract_paths(goal_excerpt)))
+        # 1) parse UML @file mappings from selected .puml files
+        uml_map: Dict[str, List[str]] = {}
+        for p in files:
+            if p.suffix.lower() != ".puml":
+                continue
+            try:
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            for rp, syms in self._parse_puml_file_map(txt).items():
+                uml_map.setdefault(rp, [])
+                for s in syms:
+                    if s not in uml_map[rp]:
+                        uml_map[rp].append(s)
 
-        # Phase allowlists from orchestrated repo config
+        uml_paths = set(uml_map.keys())
+
+        # 2) Mentioned paths (objective + goal excerpt + UML @file targets)
+        mentioned = set(extract_paths(objective) + extract_paths(goal_excerpt))
+        mentioned |= uml_paths
+        mentioned_list = sorted(mentioned)
+
+        # 3) Phase allowlists from orchestrated repo config
         create_only, modify_allow = self._load_phase_rules(repo)
 
-        # Effective allowlists:
-        # - If create_only is non-empty: it becomes a hard gate for creations.
-        # - If modify_allow is non-empty: it becomes a hard gate for modifications.
         create_gate = set(mentioned)
         if create_only:
-            create_gate = create_gate & create_only
+            create_gate &= create_only
 
         modify_gate = set(mentioned)
         if modify_allow:
-            modify_gate = modify_gate & modify_allow
+            modify_gate &= modify_allow
 
+        # 4) Deterministic pre-pass: create missing files from UML @file
+        deterministic_patches: List[Patch] = []
+        for rp in sorted(uml_paths):
+            if rp not in create_gate:
+                continue
+            abs_path = repo.root / rp
+            if abs_path.exists():
+                continue
+            content = self._skeleton_for(rp, uml_map.get(rp, []))
+            deterministic_patches.append(FileContentPatch(path=abs_path, new_content=content))
+
+        # If we only need to create files, skip LLM entirely.
+        if deterministic_patches and not modify_gate:
+            return deterministic_patches
+
+        # 5) Optional LLM scaffolding for allowed modifications (and any additional creations that are explicitly mentioned)
         system_prompt = (
             "You are a scaffolding tool.\n"
             "Return ONLY JSON.\n"
@@ -180,13 +254,14 @@ class ScaffoldPhase(Phase):
         user_prompt = (
             "Create/modify files required by the repo goal and the node objective.\n\n"
             "Hard rules:\n"
-            "- Output ONLY paths that are explicitly mentioned by path in NODE OBJECTIVE or GOAL EXCERPT.\n"
+            "- Output ONLY paths in MENTIONED PATHS (includes UML @file targets).\n"
             "- Additionally, obey the PHASE ALLOWLISTS below.\n"
             "- Provide complete file contents for each file you output.\n"
             "- Keep content minimal.\n\n"
             f"NODE OBJECTIVE:\n{objective}\n\n"
             f"GOAL EXCERPT ({goal_rel}):\n{goal_excerpt}\n\n"
-            "MENTIONED PATHS:\n" + _fmt_list(mentioned) + "\n\n"
+            "MENTIONED PATHS:\n" + _fmt_list(mentioned_list) + "\n\n"
+            "UML @file TARGETS:\n" + _fmt_list(sorted(uml_paths)) + "\n\n"
             "PHASE ALLOWLISTS (from .ai-orchestrator.json):\n"
             f"- scaffold.create_only (if present):\n{_fmt_list(sorted(create_only))}\n\n"
             f"- scaffold.modify_allow (if present):\n{_fmt_list(sorted(modify_allow))}\n\n"
@@ -204,7 +279,8 @@ class ScaffoldPhase(Phase):
             schema_name="scaffold_v1",
         )
 
-        patches: List[Patch] = []
+        patches: List[Patch] = list(deterministic_patches)
+
         for item in data.get("files", []):
             rp_raw = (item.get("path") or "").strip()
             rp = self._normalize_relpath(rp_raw)
@@ -213,8 +289,6 @@ class ScaffoldPhase(Phase):
 
             if not rp or content is None:
                 continue
-
-            # Must be mentioned, always.
             if rp not in mentioned:
                 continue
 
@@ -222,12 +296,10 @@ class ScaffoldPhase(Phase):
             exists = p.exists()
 
             if exists:
-                # Modification: allowed only if modify_gate allows it.
                 if rp not in modify_gate:
                     continue
                 patches.append(FileContentPatch(path=p, new_content=str(content)))
             else:
-                # Creation: allowed only if create_gate allows it.
                 if rp not in create_gate:
                     continue
                 patches.append(FileContentPatch(path=p, new_content=str(content)))

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Set
 import re
 
 from .base import Phase, PhaseContext
@@ -46,13 +46,24 @@ class PlanPhase(Phase):
     """
     Planner-only phase. It does not apply patches.
 
-    It returns a JSON spec that graph/planner.py will map to actual Phase instances.
+    IMPORTANT:
+    - The DAG "phase" values must be valid registered phase names.
+    - Do NOT allow the model to invent phases like "noop".
+    - We can still have a verification-only node by using an existing phase
+      (e.g. oop_refactor) with objective containing "validators only",
+      because oop_refactor.generate_patches() returns [] in that case.
 
-    Patch behavior:
-      - Read docs/ORCHESTRATOR_GOAL.md (repo-local) and extract "Create <file>" + "Update <file> so ..."
-      - Override LLM-proposed node objectives so they ALWAYS mention the correct repo-relative paths.
-      - This ensures downstream select_files includes those paths (your select_files prioritizes paths in objective).
+    Responsibilities:
+      - Read docs/ORCHESTRATOR_GOAL.md and extract Create/Update directives
+      - Read docs/**/*.puml and extract PlantUML @file mappings
+      - Build a deterministic 3-node plan:
+          1) scaffold
+          2) oop_refactor
+          3) oop_refactor (validators only)
+      - Ensure node objectives always mention explicit repo-relative paths
+        so downstream file selection is forced to include those paths.
     """
+
     name = "plan"
 
     @staticmethod
@@ -63,6 +74,18 @@ class PlanPhase(Phase):
         return goal_path.read_text(encoding="utf-8", errors="ignore")
 
     @staticmethod
+    def _read_puml_texts() -> List[str]:
+        docs_dir = Path("docs")
+        if not docs_dir.exists():
+            return []
+        out: List[str] = []
+        for p in docs_dir.rglob("*.puml"):
+            if not p.is_file():
+                continue
+            out.append(p.read_text(encoding="utf-8", errors="ignore"))
+        return out
+
+    @staticmethod
     def _normalize_repo_relpath(p: str) -> str:
         p = (p or "").strip().strip("\"'`")
         p = p.replace("\\", "/")
@@ -71,16 +94,51 @@ class PlanPhase(Phase):
         return p
 
     @classmethod
-    def _extract_goal_edits(cls, goal_text: str) -> GoalEdits:
-        """
-        Extract directives from ORCHESTRATOR_GOAL.md.
+    def _extract_plantuml_blocks(cls, markdown: str) -> List[str]:
+        if not markdown:
+            return []
+        blocks: List[str] = []
+        fence_re = re.compile(r"```plantuml\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+        for m in fence_re.finditer(markdown):
+            blocks.append(m.group(1).strip())
+        return blocks
 
-        Supported patterns (intentionally conservative):
-          - Create ... `path/to/file.py`
-          - **`path/to/file.py`** under "Create the following new files"
-          - Update `path/to/file.py` so <instruction>
-          - * Update `path/to/file.py` so <instruction>
+    @classmethod
+    def _extract_uml_file_mappings(cls, texts: List[str]) -> List[str]:
         """
+        Extract @file repo-relative mappings from PlantUML text.
+
+        Convention:
+            @file <repo-relative-path>
+
+        Returns normalized POSIX repo-relative paths (deduped, order-preserving).
+        """
+        file_re = re.compile(r"^\s*@file\s+(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+        seen: Set[str] = set()
+        out: List[str] = []
+        for t in texts:
+            if not t:
+                continue
+            for raw in file_re.findall(t):
+                p = cls._normalize_repo_relpath(raw)
+                if not p:
+                    continue
+                pp = Path(p)
+                # reject absolute / traversal / drive-letter
+                if pp.is_absolute():
+                    continue
+                if pp.parts and pp.parts[0].endswith(":"):
+                    continue
+                if ".." in pp.parts:
+                    continue
+                rp = pp.as_posix()
+                if rp not in seen:
+                    seen.add(rp)
+                    out.append(rp)
+        return out
+
+    @classmethod
+    def _extract_goal_edits(cls, goal_text: str) -> GoalEdits:
         creates: List[Tuple[str, str]] = []
         updates: List[Tuple[str, str]] = []
 
@@ -89,7 +147,7 @@ class PlanPhase(Phase):
 
         lines = goal_text.splitlines()
 
-        # A) "Update `file` so ..." bullet lines
+        # Update `file` so ...
         upd_re = re.compile(
             r"^\s*(?:[-*]\s*)?Update\s+`([^`]+)`\s+so\s+(.*)\s*$",
             re.IGNORECASE,
@@ -100,11 +158,10 @@ class PlanPhase(Phase):
                 continue
             path = cls._normalize_repo_relpath(m.group(1))
             instr = m.group(2).strip()
-            if path:
+            if path and path.lower() != "@file":
                 updates.append((path, instr))
 
-        # B) "Create ..." lines mentioning backticked paths
-        #    We extract any backticked path on a line containing "Create"
+        # Create ... with backticked paths
         create_line_re = re.compile(r"^\s*(?:[-*]\s*)?Create\b", re.IGNORECASE)
         backtick_path_re = re.compile(r"`([^`]+)`")
         for ln in lines:
@@ -112,18 +169,27 @@ class PlanPhase(Phase):
                 continue
             for bt in backtick_path_re.findall(ln):
                 path = cls._normalize_repo_relpath(bt)
-                if path:
-                    creates.append((path, "create"))
+                if not path or path.lower() == "@file":
+                    continue
+                if "<" in path or ">" in path:
+                    continue
+                if ("/" not in path and "\\" not in path) and not path.endswith((".py", ".puml", ".md", ".json")):
+                    continue
+                creates.append((path, "create"))
 
-        # C) Under "Create the following new files:" sections, you often have enumerated items with **`path`**
+        # **`path`** pattern
         strong_backtick_re = re.compile(r"\*\*`([^`]+)`\*\*")
         for ln in lines:
             for bt in strong_backtick_re.findall(ln):
                 path = cls._normalize_repo_relpath(bt)
-                if path:
-                    creates.append((path, "create"))
+                if not path or path.lower() == "@file":
+                    continue
+                if "<" in path or ">" in path:
+                    continue
+                if ("/" not in path and "\\" not in path) and not path.endswith((".py", ".puml", ".md", ".json")):
+                    continue
+                creates.append((path, "create"))
 
-        # Dedup while preserving order
         def _dedup(items: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
             seen = set()
             out: List[Tuple[str, str]] = []
@@ -153,96 +219,96 @@ class PlanPhase(Phase):
         requested_phase: str,
         available_validators: List[str],
     ) -> Dict[str, Any]:
-        system_prompt = (
-            "You are a software delivery planner. You output a small DAG plan of steps.\n"
-            "You must only use available phase names and available validators.\n"
-            "Prefer small steps and deterministic validation.\n"
-            "Use default validators unless additional safeguards are explicitly requested.\n"
-            "Node objectives MUST include repo-relative file paths for any files to be created/edited.\n"
-        )
-
-        user_prompt = (
-            f"Create a DAG plan for running the orchestrator.\n\n"
-            f"Requested target phase: {requested_phase}\n"
-            f"Available phases: {available_phases}\n"
-            f"Available validators: {available_validators}\n\n"
-            "Hard requirements:\n"
-            "- Output EXACTLY 3 nodes.\n"
-            "- commit_policy MUST be 'per_node'.\n"
-            "- Node 1 MUST be phase 'scaffold'.\n"
-            "- Node 2 MUST be phase 'oop_refactor' and depend on Node 1.\n"
-            "- Node 3 MUST be verification-only (validators only) and depend on Node 2.\n"
-            "- Node 3 objective MUST include the phrase 'validators only'.\n"
-            "- Every node objective MUST mention explicit repo-relative file paths to create/edit.\n"
-            "- Deps must refer only to earlier node ids.\n\n"
-            "Validation guidance:\n"
-            "- Use default validators (e.g. tests) unless otherwise required.\n"
-            "- Do NOT invent validators.\n"
-            "- If unsure, include only tests.\n\n"
-            "Return ONLY JSON per schema."
-        )
-
-        spec = llm.complete_json(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            schema=SCHEMA_DAG_PLAN_V1,
-            schema_name="dag_plan_v1",
-        )
-
-        # ---- Post-process objectives from the goal doc (project-agnostic) ----
+        # ---- Parse goal + UML ----
         goal_text = self._read_goal_text()
         edits = self._extract_goal_edits(goal_text)
 
+        puml_texts = self._read_puml_texts()
+        puml_texts.extend(self._extract_plantuml_blocks(goal_text))
+        uml_paths = self._extract_uml_file_mappings(puml_texts)
+
         create_paths = [p for p, _ in edits.creates]
         update_paths = [p for p, _ in edits.updates]
-        all_paths = sorted({*create_paths, *update_paths})
 
-        # Build deterministic objective strings if goal has directives.
-        scaffold_obj = ""
+        all_paths = sorted({*create_paths, *update_paths, *uml_paths})
+
+        # ---- Build deterministic objectives ----
+        scaffold_lines: List[str] = ["Create the following files:"]
         if create_paths:
-            scaffold_obj = (
-                "Create the following files as specified in docs/ORCHESTRATOR_GOAL.md:\n"
-                + "\n".join(f"- {p}" for p in create_paths)
-            )
+            scaffold_lines.append("From docs/ORCHESTRATOR_GOAL.md:")
+            scaffold_lines.extend([f"- {p}" for p in create_paths])
+        if uml_paths:
+            scaffold_lines.append("From PlantUML @file mappings (architecture):")
+            scaffold_lines.extend([f"- {p}" for p in uml_paths])
+        scaffold_obj = "\n".join(scaffold_lines)
 
-        oop_obj = ""
+        oop_lines: List[str] = ["Implement the following goal-directed edits:"]
         if edits.updates:
-            lines = ["Implement the following goal-directed edits:"]
             for p, instr in edits.updates:
                 if instr:
-                    lines.append(f"- Edit {p} to {instr}")
+                    oop_lines.append(f"- Edit {p} to {instr}")
                 else:
-                    lines.append(f"- Edit {p} according to docs/ORCHESTRATOR_GOAL.md")
-            oop_obj = "\n".join(lines)
+                    oop_lines.append(f"- Edit {p} according to docs/ORCHESTRATOR_GOAL.md")
+        if uml_paths:
+            oop_lines.append("Implement the PlantUML @file targets (architecture):")
+            oop_lines.extend([f"- {p}" for p in uml_paths])
+        oop_obj = "\n".join(oop_lines)
 
-        verify_obj = ""
+        verify_obj = "validators only"
         if all_paths:
-            verify_obj = (
-                "validators only\n"
-                "Validate goal contracts and behavior for these paths:\n"
+            verify_obj += (
+                "\nValidate goal contracts and behavior for these paths:\n"
                 + "\n".join(f"- {p}" for p in all_paths)
             )
-        else:
-            verify_obj = "validators only"
 
-        # Rewrite objectives per phase (do NOT alter deps/validators here).
-        # If goal had no directives, keep LLM objectives.
-        if goal_text.strip() and (create_paths or update_paths):
-            nodes = spec.get("nodes") or []
-            for n in nodes:
-                phase = str(n.get("phase") or "")
-                if phase == "scaffold" and scaffold_obj:
-                    n["objective"] = scaffold_obj
-                elif phase == "oop_refactor" and oop_obj and "validators only" not in str(n.get("objective") or "").lower():
-                    n["objective"] = oop_obj
-                elif "validators only" in str(n.get("objective") or "").lower():
-                    n["objective"] = verify_obj
+        # ---- Validators ----
+        default_validators = ["tests"] if "tests" in (available_validators or []) else list(available_validators or [])
+        if not default_validators:
+            default_validators = ["tests"]
 
-                # Safety: ensure referenced paths appear even if LLM output survives.
-                # This forces downstream file selection to include the goal paths.
-                if phase == "scaffold" and create_paths:
-                    n["objective"] = self._ensure_paths_in_objective(str(n.get("objective") or ""), create_paths)
-                if phase == "oop_refactor" and update_paths:
-                    n["objective"] = self._ensure_paths_in_objective(str(n.get("objective") or ""), update_paths)
+        # ---- Phases: must be registered ----
+        # We *require* scaffold + oop_refactor to exist if you’re calling this.
+        # Verification node uses oop_refactor with "validators only" objective so it generates no patches.
+        nodes = [
+            {
+                "id": "scaffold_intro",
+                "phase": "scaffold",
+                "deps": [],
+                "validators": [],
+                "objective": scaffold_obj,
+            },
+            {
+                "id": "oop_refactor_run",
+                "phase": "oop_refactor",
+                "deps": ["scaffold_intro"],
+                "validators": [],
+                "objective": oop_obj,
+            },
+            {
+                "id": "verification_step",
+                "phase": "oop_refactor",
+                "deps": ["oop_refactor_run"],
+                "validators": [],
+                "objective": verify_obj,
+            },
+        ]
 
+        # Hard safety: also force paths into objectives (selection relies on this).
+        if create_paths:
+            nodes[0]["objective"] = self._ensure_paths_in_objective(nodes[0]["objective"], create_paths)
+        if uml_paths:
+            nodes[0]["objective"] = self._ensure_paths_in_objective(nodes[0]["objective"], uml_paths)
+            nodes[1]["objective"] = self._ensure_paths_in_objective(nodes[1]["objective"], uml_paths)
+        if update_paths:
+            nodes[1]["objective"] = self._ensure_paths_in_objective(nodes[1]["objective"], update_paths)
+        if all_paths:
+            nodes[2]["objective"] = self._ensure_paths_in_objective(nodes[2]["objective"], all_paths)
+
+        spec = {
+            "commit_policy": "per_node",
+            "default_validators": default_validators,
+            "nodes": nodes,
+        }
+
+        # Keep output shape compatible with the existing planner schema.
         return spec
