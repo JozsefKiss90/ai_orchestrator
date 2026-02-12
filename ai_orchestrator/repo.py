@@ -1,4 +1,3 @@
-# ai_orchestrator/repo.py
 from __future__ import annotations
 
 import fnmatch
@@ -10,7 +9,9 @@ from typing import Iterable, List, Optional, Tuple
 
 from .patching import FileContentPatch, Patch, UnifiedDiffPatch
 import logging
+
 log = logging.getLogger(__name__)
+
 
 @dataclass
 class CommandResult:
@@ -74,11 +75,8 @@ class Repo:
         - a string (legacy) -> executed via shell
         - a list of argv tokens (preferred) -> executed without shell (safe)
         """
-        import subprocess
-
         try:
             if isinstance(cmd, list):
-                # SAFE: no shell re-tokenization
                 p = subprocess.run(
                     cmd,
                     cwd=str(self.root),
@@ -88,7 +86,6 @@ class Repo:
                 )
                 res = CommandResult(p.returncode, p.stdout or "", p.stderr or "")
             else:
-                # Legacy path: keep for now, but this is shell-fragile.
                 p = subprocess.run(
                     cmd,
                     cwd=str(self.root),
@@ -104,7 +101,6 @@ class Repo:
         except Exception as e:
             log.warning("Command failed", extra={"fields": {"cmd": cmd, "error": str(e)}})
             return CommandResult(1, "", str(e))
-
 
     def run_tests(self, test_command: Optional[str]) -> CommandResult:
         if not test_command:
@@ -127,6 +123,22 @@ class Repo:
         else:
             self.git(["checkout", branch_name])
 
+    @staticmethod
+    def _is_nothing_to_commit(res: CommandResult) -> bool:
+        """
+        Git returns non-zero for 'nothing to commit' in some cases.
+        This is a benign no-op and must NOT be treated as pipeline failure.
+        """
+        txt = (res.stdout or "") + "\n" + (res.stderr or "")
+        txt_l = txt.lower()
+        needles = [
+            "nothing to commit",
+            "working tree clean",
+            "no changes added to commit",
+            "nothing added to commit",
+        ]
+        return any(n in txt_l for n in needles)
+
     def commit_all(self, message: str) -> CommandResult:
         """
         Stage all changes and commit.
@@ -134,17 +146,27 @@ class Repo:
         Returns:
         - If staging fails: staging result
         - Else: commit result
+        - If commit is a benign no-op ('nothing to commit'): ok result (returncode=0)
         """
         add_res = self.git(["add", "."])
         if not add_res.ok:
-            # Surface staging stderr (common source of 'pathspec' errors)
             return add_res
-        return self.git(["commit", "-m", message])
 
+        commit_res = self.git(["commit", "-m", message])
+        if commit_res.ok:
+            return commit_res
 
+        if self._is_nothing_to_commit(commit_res):
+            # Normalize benign no-op into success.
+            return CommandResult(
+                0,
+                commit_res.stdout or "Nothing to commit; working tree clean.",
+                commit_res.stderr or "",
+            )
+
+        return commit_res
 
     # ---------- Unified diff hardening ----------
-
     _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 
     @staticmethod
@@ -161,15 +183,11 @@ class Repo:
           - at least one valid range hunk header:
               @@ -l,s +l,s @@
           - hard reject any invalid hunk header (e.g. naked '@@').
-
-        NOTE: We intentionally DO NOT require both 'diff --git' and legacy headers simultaneously.
-        Many valid diffs contain both, but some tools emit only one style.
         """
         if not isinstance(diff_text, str) or not diff_text.strip():
             return False, "Diff is empty."
 
         txt = diff_text.strip("\n")
-
         lines = txt.splitlines()
 
         has_diff_git = any(line.startswith("diff --git ") for line in lines)
@@ -181,11 +199,9 @@ class Repo:
                 "Diff must include either a 'diff --git a/... b/...' header or a '--- ...'/'+++ ...' header pair."
             )
 
-        # Validate that ---/+++ paths look git-ish if present
         if has_minus or has_plus:
             if not (has_minus and has_plus):
                 return False, "Diff contains only one of '---' or '+++' headers; both are required."
-            # Allow: a/<path>, b/<path>, /dev/null
             bad_headers: List[str] = []
             for line in lines:
                 if line.startswith("--- "):
@@ -199,7 +215,6 @@ class Repo:
             if bad_headers:
                 return False, f"Diff contains non-git file header(s): {bad_headers[:3]!r}"
 
-        # Hard reject invalid hunks; require at least one valid hunk header.
         saw_hunk = False
         for line in lines:
             if line.startswith("@@"):
@@ -219,7 +234,6 @@ class Repo:
         """
         Runs `git apply --check` to produce diagnostics for failures without applying.
         """
-        # (2) Windows-hardening: ensure trailing newline so stdin piping can't produce "corrupt patch" due to EOF edge cases.
         if isinstance(diff_text, str) and diff_text and not diff_text.endswith("\n"):
             diff_text = diff_text + "\n"
 
@@ -245,20 +259,10 @@ class Repo:
             )
         return CommandResult(returncode=proc.returncode, stdout=proc.stdout, stderr=stderr)
 
-
     def apply_unified_diff(self, diff_text: str, *, update_index: bool = False) -> CommandResult:
         """
         Apply a unified diff using `git apply`, with a fail-fast preflight.
-
-        Flow:
-          1) local sanity check
-          2) git apply --check
-          3) git apply [--index]
-
-        Uses:
-          git apply --whitespace=nowarn --recount [--index]
         """
-        # (2) Windows-hardening: ensure trailing newline so stdin piping can't produce "corrupt patch" due to EOF edge cases.
         if isinstance(diff_text, str) and diff_text and not diff_text.endswith("\n"):
             diff_text = diff_text + "\n"
 
@@ -290,7 +294,6 @@ class Repo:
                 f"Raw git stderr:\n{proc.stderr}"
             )
         return CommandResult(returncode=proc.returncode, stdout=proc.stdout, stderr=stderr)
-
 
     def apply_patches(self, patches: List[Patch]) -> CommandResult:
         """

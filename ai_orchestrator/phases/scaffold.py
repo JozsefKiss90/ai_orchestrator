@@ -1,4 +1,3 @@
-# ai_orchestrator/phases/scaffold.py
 from __future__ import annotations
 
 import json
@@ -68,7 +67,8 @@ class ScaffoldPhase(Phase):
                 if not isinstance(x, str):
                     continue
                 rp = self._normalize_relpath(x)
-                if rp and self._safe_repo_relpath(rp) is not None:
+                rp = self._safe_repo_relpath(rp) or ""
+                if rp and self._looks_like_file_path(rp):
                     out.add(rp)
             return out
 
@@ -96,9 +96,29 @@ class ScaffoldPhase(Phase):
             return None
         if len(p.parts) > 0 and p.parts[0].endswith(":"):
             return None
-        if ".." in p.parts:
+        if ".." in p.parts or "." in p.parts:
             return None
         return Path(p.as_posix()).as_posix()
+
+    @staticmethod
+    def _looks_like_file_path(rp: str) -> bool:
+        """
+        Filter out garbage pseudo-paths like 'field/attribute' or 'import/use/field'.
+
+        Heuristic:
+          - must be repo-rel (already enforced elsewhere)
+          - must contain a slash
+          - must have a filename with an extension
+        """
+        if not rp or not isinstance(rp, str):
+            return False
+        rp = rp.replace("\\", "/").strip()
+        if "/" not in rp:
+            return False
+        name = Path(rp).name
+        if "." not in name:
+            return False
+        return True
 
     @staticmethod
     def _parse_puml_file_map(puml_text: str) -> Dict[str, List[str]]:
@@ -132,7 +152,7 @@ class ScaffoldPhase(Phase):
                 if m_file:
                     rp = ScaffoldPhase._normalize_relpath(m_file.group(1))
                     rp = ScaffoldPhase._safe_repo_relpath(rp) or ""
-                    if rp:
+                    if rp and ScaffoldPhase._looks_like_file_path(rp):
                         mapping[rp].append(in_note_for_symbol)
 
         return dict(mapping)
@@ -187,6 +207,8 @@ class ScaffoldPhase(Phase):
                 rp = self._normalize_relpath(c)
                 rp = self._safe_repo_relpath(rp) or ""
                 if not rp:
+                    continue
+                if not self._looks_like_file_path(rp):
                     continue
                 if rp not in seen:
                     seen.add(rp)
@@ -281,13 +303,40 @@ class ScaffoldPhase(Phase):
 
         patches: List[Patch] = list(deterministic_patches)
 
-        for item in data.get("files", []):
+        raw_files = data.get("files", [])
+        if not isinstance(raw_files, list):
+            raw_files = []
+
+        for item in raw_files:
+            # HARDEN Step 4: tolerate malformed output (strings instead of dicts)
+            if isinstance(item, str):
+                rp = self._normalize_relpath(item)
+                rp = self._safe_repo_relpath(rp) or ""
+                if not rp or not self._looks_like_file_path(rp):
+                    continue
+                if rp not in mentioned:
+                    continue
+                p = repo.root / rp
+                if p.exists():
+                    # No content provided; skip modifications.
+                    continue
+                if rp not in create_gate:
+                    continue
+                content = self._skeleton_for(rp, uml_map.get(rp, []))
+                patches.append(FileContentPatch(path=p, new_content=content))
+                continue
+
+            if not isinstance(item, dict):
+                continue
+
             rp_raw = (item.get("path") or "").strip()
             rp = self._normalize_relpath(rp_raw)
             rp = self._safe_repo_relpath(rp) or ""
             content = item.get("content")
 
             if not rp or content is None:
+                continue
+            if not self._looks_like_file_path(rp):
                 continue
             if rp not in mentioned:
                 continue
